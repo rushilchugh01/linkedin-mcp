@@ -401,6 +401,15 @@ def load_from_args(config: AppConfig) -> AppConfig:
     feed_engagement_parser.add_argument("--reaction-type", type=str, default=None)
     feed_engagement_parser.add_argument("--output", type=str, default=None)
 
+    recent_connections_parser = subparsers.add_parser(
+        "recent-connections",
+        help="Get recent LinkedIn connections from the past N days",
+    )
+    recent_connections_parser.add_argument(
+        "--days", type=int, default=10, help="How many days back to look (default: 10)"
+    )
+    recent_connections_parser.add_argument("--output", type=str, default=None)
+
     args = parser.parse_args()
 
     # Update configuration with parsed arguments

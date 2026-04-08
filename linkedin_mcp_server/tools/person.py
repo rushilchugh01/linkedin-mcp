@@ -16,6 +16,7 @@ from linkedin_mcp_server.core.exceptions import AuthenticationError
 from linkedin_mcp_server.dependencies import get_ready_extractor, handle_auth_error
 from linkedin_mcp_server.error_handler import raise_tool_error
 from linkedin_mcp_server.scraping import parse_person_sections
+from linkedin_mcp_server.scraping.connections import scrape_recent_connections
 
 logger = logging.getLogger(__name__)
 
@@ -269,3 +270,63 @@ def register_person_tools(mcp: FastMCP) -> None:
                 raise_tool_error(relogin_exc, "get_sidebar_profiles")
         except Exception as e:
             raise_tool_error(e, "get_sidebar_profiles")  # NoReturn
+
+    @mcp.tool(
+        timeout=TOOL_TIMEOUT_SECONDS,
+        title="Get Recent Connections",
+        annotations={"readOnlyHint": True, "openWorldHint": True},
+        tags={"person", "scraping", "connections"},
+        exclude_args=["extractor"],
+    )
+    async def get_recent_connections(
+        ctx: Context,
+        days: int = 10,
+        extractor: Any | None = None,
+    ) -> dict[str, Any]:
+        """
+        Get recent LinkedIn connections from the past N days.
+
+        Navigates to the connections page (sorted by "Recently added"),
+        scrolls until connections older than the cutoff date are reached,
+        and returns structured profile data for each connection.
+
+        This does NOT consume LinkedIn search limits — it reads your own
+        connections page directly.
+
+        Args:
+            ctx: FastMCP context for progress reporting
+            days: How many days back to look (default: 10, max: 365)
+
+        Returns:
+            Dict with url, connections list, total_found,
+            total_within_range, cutoff_date, and diagnostics.
+            Each connection includes name, username, profile_url,
+            headline, connected_date, connected_date_raw, and profile_urn.
+        """
+        try:
+            extractor = extractor or await get_ready_extractor(
+                ctx, tool_name="get_recent_connections"
+            )
+            logger.info("Getting recent connections: days=%d", days)
+
+            await ctx.report_progress(
+                progress=0,
+                total=100,
+                message=f"Fetching connections from the past {days} days",
+            )
+
+            result = await scrape_recent_connections(
+                extractor, days=days
+            )
+
+            await ctx.report_progress(progress=100, total=100, message="Complete")
+
+            return result
+
+        except AuthenticationError as e:
+            try:
+                await handle_auth_error(e, ctx)
+            except Exception as relogin_exc:
+                raise_tool_error(relogin_exc, "get_recent_connections")
+        except Exception as e:
+            raise_tool_error(e, "get_recent_connections")  # NoReturn

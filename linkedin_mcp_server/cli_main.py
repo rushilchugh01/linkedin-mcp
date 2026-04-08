@@ -44,6 +44,7 @@ from linkedin_mcp_server.session_state import (
 )
 from linkedin_mcp_server.server import create_mcp_server
 from linkedin_mcp_server.setup import run_profile_creation
+from linkedin_mcp_server.scraping.connections import scrape_recent_connections
 from linkedin_mcp_server.workflows.company_engagement import collect_company_engagement
 from linkedin_mcp_server.workflows.feed_engagement import (
     collect_feed_engagement,
@@ -316,6 +317,11 @@ async def _run_direct_cli_command(config: AppConfig) -> dict[str, Any]:
             min_reactions=args.get("min_reactions", 0),
             min_comments=args.get("min_comments", 0),
             include_promoted=args.get("include_promoted", False),
+        )
+    if command == "recent-connections":
+        return await scrape_recent_connections(
+            extractor,
+            days=args.get("days", 10),
         )
     raise ValueError(f"Unknown direct CLI command: {command}")
 
