@@ -52,7 +52,7 @@ Find legal AI posts in my home feed and collect up to 5 comments and 5 reactors 
 
 | Tool | Description | Status |
 |------|-------------|--------|
-| `get_person_profile` | Get profile info with explicit section selection plus parsed connection metadata (`status`, `degree`, `is_connected`, `is_pending`, `is_connectable`) | working |
+| `get_person_profile` | Get profile info with default contact-info overlay extraction, explicit extra sections, parsed contact fields, and connection metadata (`status`, `degree`, `is_connected`, `is_pending`, `is_connectable`) | working |
 | `connect_with_person` | Send a connection request or accept an incoming one, with optional note; this fork uses the Veridis top-card flow first instead of relying on upstream's older text/button flow | improved in fork |
 | `get_sidebar_profiles` | Extract profile URLs from sidebar recommendation sections ("More profiles for you", "Explore premium profiles", "People you may know") on a profile page | working |
 | `get_inbox` | List recent conversations from the LinkedIn messaging inbox | working |
@@ -158,13 +158,14 @@ tables such as:
 - `company_post_edges` for relationships such as posts discovered from a
   company page
 
-Profiles are deduped by normalized LinkedIn profile URL. Posts are deduped by
-normalized feed update URL. Comments keep `comment_text`, `like_count`, and
-`reply_count`. Posts keep `post_text` and engagement counts. The edge table makes
-queries like "show all posts this profile commented on" or "show every profile
-associated with this post" straightforward. Edge and visit rows also store the
-latest `tool_run_id`, so you can trace a CRM record back to a trimmed raw tool
-output snapshot.
+Profiles are deduped by normalized LinkedIn profile URL and can store first
+observed email, phone, connected-since date, contact-info JSON, connection
+metadata, and a trimmed payload snapshot. Posts are deduped by normalized feed
+update URL. Comments keep `comment_text`, `like_count`, and `reply_count`. Posts
+keep `post_text` and engagement counts. The edge table makes queries like "show
+all posts this profile commented on" or "show every profile associated with this
+post" straightforward. Edge and visit rows also store the latest `tool_run_id`,
+so you can trace a CRM record back to a trimmed raw tool output snapshot.
 
 Privacy note: this database stores LinkedIn personal data locally on your
 machine. Keep it out of shared folders and do not sync it to git or cloud

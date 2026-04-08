@@ -29,13 +29,13 @@ def parse_person_sections(
 ) -> tuple[set[str], list[str]]:
     """Parse comma-separated section names into a set of requested sections.
 
-    "main_profile" is always included. Empty/None returns {"main_profile"} only.
+    "main_profile" and "contact_info" are always included.
     Unknown section names are logged as warnings and returned.
 
     Returns:
         Tuple of (requested_sections, unknown_section_names).
     """
-    requested: set[str] = {"main_profile"}
+    requested: set[str] = {"main_profile", "contact_info"}
     unknown: list[str] = []
     if not sections:
         return requested, unknown

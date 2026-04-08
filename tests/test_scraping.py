@@ -20,6 +20,7 @@ from linkedin_mcp_server.scraping.extractor import (
     _RATE_LIMITED_MSG,
     _filter_recent_activity_to_past_year,
     _truncate_linkedin_noise,
+    parse_contact_info,
     strip_linkedin_noise,
 )
 from linkedin_mcp_server.scraping.link_metadata import Reference
@@ -29,9 +30,15 @@ def extracted(
     text: str,
     references: list[Reference] | None = None,
     error: dict | None = None,
+    structured: dict | None = None,
 ) -> ExtractedSection:
     """Create an ExtractedSection for tests."""
-    return ExtractedSection(text=text, references=references or [], error=error)
+    return ExtractedSection(
+        text=text,
+        references=references or [],
+        error=error,
+        structured=structured,
+    )
 
 
 class TestBuildJobSearchUrl:
@@ -711,6 +718,78 @@ class TestScrapePersonUrls:
         assert any("/overlay/contact-info/" in u for u in overlay_urls)
         assert any("/recent-activity/all/" in u for u in all_urls)
         assert set(result["sections"]) == all_sections
+
+    async def test_contact_info_structured_fields_are_returned(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        contact_info = {
+            "emails": ["person@example.com"],
+            "phones": ["+1 555 123 4567"],
+            "profile_urls": ["https://www.linkedin.com/in/testuser/"],
+            "websites": [],
+            "connected_since": "Mar 26, 2026",
+        }
+        with (
+            patch.object(
+                extractor,
+                "extract_page",
+                new_callable=AsyncMock,
+                return_value=extracted("Jane Doe\n\n· 1st\n\nGeneral Counsel"),
+            ),
+            patch.object(
+                extractor,
+                "_extract_overlay",
+                new_callable=AsyncMock,
+                return_value=extracted(
+                    "Contact info\nEmail\nperson@example.com",
+                    structured=contact_info,
+                ),
+            ) as mock_overlay,
+            patch(
+                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await extractor.scrape_person(
+                "testuser", {"main_profile", "contact_info"}
+            )
+
+        assert mock_overlay.await_count == 1
+        assert result["sections"]["contact_info"] == (
+            "Contact info\nEmail\nperson@example.com"
+        )
+        assert result["structured_sections"]["contact_info"] == contact_info
+        assert result["contact_info"] == contact_info
+
+    def test_parse_contact_info_extracts_email_phone_and_connected_since(self):
+        parsed = parse_contact_info(
+            "Contact info\nEmail\nperson@example.com\nConnected since Mar 26, 2026",
+            [
+                {
+                    "href": "mailto:person@example.com",
+                    "text": "person@example.com",
+                },
+                {
+                    "href": "tel:+15551234567",
+                    "text": "+1 555 123 4567",
+                },
+                {
+                    "href": "https://www.linkedin.com/in/testuser/",
+                    "text": "Profile",
+                },
+                {
+                    "href": "https://example.com",
+                    "text": "Website",
+                },
+            ],
+        )
+
+        assert parsed == {
+            "emails": ["person@example.com"],
+            "phones": ["+1 555 123 4567"],
+            "profile_urls": ["https://www.linkedin.com/in/testuser/"],
+            "websites": [{"url": "https://example.com", "text": "Website"}],
+            "connected_since": "Mar 26, 2026",
+        }
 
     async def test_posts_visits_recent_activity(self, mock_page):
         extractor = LinkedInExtractor(mock_page)

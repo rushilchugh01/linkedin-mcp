@@ -61,6 +61,8 @@ class TestPersonTool:
         assert "main_profile" in result["sections"]
         assert "pages_visited" not in result
         assert "sections_requested" not in result
+        call_args = mock_extractor.scrape_person.call_args
+        assert "contact_info" in call_args[0][1]
 
     async def test_get_person_profile_with_sections(self, mock_context):
         """Verify sections parameter is passed through."""

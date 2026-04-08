@@ -9,7 +9,7 @@ import logging
 import random
 import re
 from typing import TYPE_CHECKING, Any, Literal
-from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 
 from patchright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 
@@ -102,6 +102,12 @@ _RELATIVE_ACTIVITY_AGE_RE = re.compile(
 _ABSOLUTE_ACTIVITY_DATE_RE = re.compile(
     r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+"
     r"\d{1,2},\s+\d{4}\b",
+    re.IGNORECASE,
+)
+_EMAIL_RE = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w.-])")
+_PHONE_RE = re.compile(r"(?<!\w)(?:\+?\d[\d\s().-]{7,}\d)(?!\w)")
+_CONNECTED_SINCE_RE = re.compile(
+    r"\bConnected since\s+([A-Za-z]{3,9}\.?\s+\d{1,2},\s+\d{4})",
     re.IGNORECASE,
 )
 
@@ -256,6 +262,7 @@ class ExtractedSection:
     text: str
     references: list[Reference]
     error: dict[str, Any] | None = None
+    structured: dict[str, Any] | None = None
 
 
 def strip_linkedin_noise(text: str) -> str:
@@ -265,6 +272,105 @@ def strip_linkedin_noise(text: str) -> str:
     """
     cleaned = _truncate_linkedin_noise(text)
     return _filter_linkedin_noise_lines(cleaned)
+
+
+def parse_contact_info(
+    text: str,
+    raw_references: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Extract stable fields from LinkedIn's contact-info overlay."""
+    emails: list[str] = []
+    phones: list[str] = []
+    profile_urls: list[str] = []
+    websites: list[dict[str, str]] = []
+
+    def add_email(value: str) -> None:
+        normalized = value.strip().lower()
+        if normalized and normalized not in emails:
+            emails.append(normalized)
+
+    def add_phone(value: str) -> None:
+        normalized = re.sub(r"\s+", " ", value).strip()
+        if normalized and normalized not in phones:
+            phones.append(normalized)
+
+    def add_profile_url(value: str) -> None:
+        normalized = _normalize_public_profile_url(value)
+        if normalized and normalized not in profile_urls:
+            profile_urls.append(normalized)
+
+    for raw in raw_references or []:
+        href = str(raw.get("href") or "").strip()
+        label = (
+            str(raw.get("text") or raw.get("aria_label") or raw.get("title") or "")
+            .strip()
+        )
+        parsed = urlparse(href)
+        scheme = parsed.scheme.lower()
+        if scheme == "mailto":
+            for match in _EMAIL_RE.findall(unquote(parsed.path or "")):
+                add_email(match)
+        elif scheme == "tel":
+            phone_matches = _PHONE_RE.findall(label)
+            if phone_matches:
+                for match in phone_matches:
+                    add_phone(match)
+            else:
+                add_phone(unquote(parsed.path or ""))
+        else:
+            add_profile_url(href)
+            if scheme in {"http", "https"} and not _is_linkedin_url(href):
+                websites.append({"url": href, "text": label} if label else {"url": href})
+
+        for match in _EMAIL_RE.findall(label):
+            add_email(match)
+        if scheme != "tel":
+            for match in _PHONE_RE.findall(label):
+                add_phone(match)
+
+    for match in _EMAIL_RE.findall(text):
+        add_email(match)
+    for match in _PHONE_RE.findall(text):
+        add_phone(match)
+
+    result: dict[str, Any] = {
+        "emails": emails,
+        "phones": phones,
+        "profile_urls": profile_urls,
+        "websites": _dedupe_dicts_by_url(websites),
+    }
+    if match := _CONNECTED_SINCE_RE.search(text):
+        result["connected_since"] = match.group(1).strip()
+    return result
+
+
+def _normalize_public_profile_url(value: str) -> str:
+    parsed = urlparse(value.strip())
+    if not parsed.scheme and value.startswith("/"):
+        parsed = urlparse(f"https://www.linkedin.com{value}")
+    if parsed.netloc.lower() not in {"linkedin.com", "www.linkedin.com"}:
+        return ""
+    if not parsed.path.startswith("/in/"):
+        return ""
+    username = parsed.path.split("/", 3)[2]
+    return f"https://www.linkedin.com/in/{username}/"
+
+
+def _is_linkedin_url(value: str) -> bool:
+    parsed = urlparse(value.strip())
+    return parsed.netloc.lower() in {"linkedin.com", "www.linkedin.com"}
+
+
+def _dedupe_dicts_by_url(values: list[dict[str, str]]) -> list[dict[str, str]]:
+    seen: set[str] = set()
+    deduped: list[dict[str, str]] = []
+    for value in values:
+        url = value.get("url", "")
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        deduped.append(value)
+    return deduped
 
 
 def _filter_linkedin_noise_lines(text: str) -> str:
@@ -931,9 +1037,15 @@ class LinkedInExtractor:
             )
             return ExtractedSection(text=_RATE_LIMITED_MSG, references=[])
         cleaned = _filter_linkedin_noise_lines(truncated)
+        structured = (
+            parse_contact_info(cleaned, raw_result["references"])
+            if section_name == "contact_info"
+            else None
+        )
         return ExtractedSection(
             text=cleaned,
             references=build_references(raw_result["references"], section_name),
+            structured=structured,
         )
 
     async def scrape_person(
@@ -951,6 +1063,7 @@ class LinkedInExtractor:
         base_url = f"https://www.linkedin.com/in/{username}"
         sections: dict[str, str] = {}
         references: dict[str, list[Reference]] = {}
+        structured_sections: dict[str, dict[str, Any]] = {}
         section_errors: dict[str, dict[str, Any]] = {}
         profile_urn: str | None = None
 
@@ -986,12 +1099,15 @@ class LinkedInExtractor:
                                 ),
                                 references=extracted.references,
                                 error=extracted.error,
+                                structured=extracted.structured,
                             )
 
                     if extracted.text and extracted.text != _RATE_LIMITED_MSG:
                         sections[section_name] = extracted.text
                         if extracted.references:
                             references[section_name] = extracted.references
+                        if extracted.structured is not None:
+                            structured_sections[section_name] = extracted.structured
                     elif extracted.error:
                         section_errors[section_name] = extracted.error
 
@@ -1031,6 +1147,10 @@ class LinkedInExtractor:
             result["profile_urn"] = profile_urn
         if references:
             result["references"] = references
+        if structured_sections:
+            result["structured_sections"] = structured_sections
+        if contact_info := structured_sections.get("contact_info"):
+            result["contact_info"] = contact_info
         if section_errors:
             result["section_errors"] = section_errors
 

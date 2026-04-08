@@ -108,11 +108,16 @@ class LocalCrmStore:
                 profile_url TEXT PRIMARY KEY,
                 name TEXT,
                 headline TEXT,
+                email TEXT,
+                phone TEXT,
+                connected_since TEXT,
+                contact_info_json TEXT,
                 connection_status TEXT,
                 connection_degree TEXT,
                 source_tool TEXT,
                 first_seen_at TEXT NOT NULL,
                 last_seen_at TEXT NOT NULL,
+                payload_priority INTEGER NOT NULL DEFAULT 0,
                 payload_json TEXT NOT NULL
             );
 
@@ -200,6 +205,16 @@ class LocalCrmStore:
             """
         )
         _ensure_column(conn, "visits", "tool_run_id", "INTEGER")
+        _ensure_column(conn, "profiles", "email", "TEXT")
+        _ensure_column(conn, "profiles", "phone", "TEXT")
+        _ensure_column(conn, "profiles", "connected_since", "TEXT")
+        _ensure_column(conn, "profiles", "contact_info_json", "TEXT")
+        _ensure_column(
+            conn,
+            "profiles",
+            "payload_priority",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
         _ensure_column(conn, "profile_post_edges", "tool_run_id", "INTEGER")
         _ensure_column(conn, "company_post_edges", "tool_run_id", "INTEGER")
 
@@ -281,6 +296,7 @@ class LocalCrmStore:
             return
         lines = _section_lines(result, "main_profile")
         connection = result.get("connection") if isinstance(result.get("connection"), dict) else {}
+        contact_info = _extract_contact_info(result)
         self._upsert_profile(
             conn,
             tool_name,
@@ -288,9 +304,14 @@ class LocalCrmStore:
                 "profile_url": profile_url,
                 "name": lines[0] if lines else "",
                 "headline": lines[1] if len(lines) > 1 else "",
+                "email": _first_string(contact_info.get("emails")),
+                "phone": _first_string(contact_info.get("phones")),
+                "connected_since": str(contact_info.get("connected_since") or ""),
+                "contact_info": contact_info,
                 "connection_status": connection.get("status") or "",
                 "connection_degree": connection.get("degree") or "",
                 "payload": _trim_payload(result),
+                "payload_priority": 100,
             },
             observed_at,
             tool_run_id,
@@ -339,31 +360,60 @@ class LocalCrmStore:
         profile_url = _normalize_profile_url(str(profile.get("profile_url") or ""))
         if not profile_url:
             return
+        contact_info = (
+            profile.get("contact_info")
+            if isinstance(profile.get("contact_info"), dict)
+            else {}
+        )
+        payload_priority = _int_or_none(profile.get("payload_priority")) or 10
         conn.execute(
             """
             INSERT INTO profiles (
-                profile_url, name, headline, connection_status,
-                connection_degree, source_tool, first_seen_at, last_seen_at,
+                profile_url, name, headline, email, phone, connected_since,
+                contact_info_json, connection_status, connection_degree,
+                source_tool, first_seen_at, last_seen_at, payload_priority,
                 payload_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(profile_url) DO UPDATE SET
-                name = COALESCE(NULLIF(excluded.name, ''), profiles.name),
-                headline = COALESCE(NULLIF(excluded.headline, ''), profiles.headline),
+                name = CASE
+                    WHEN excluded.payload_priority >= profiles.payload_priority
+                    THEN COALESCE(NULLIF(excluded.name, ''), profiles.name)
+                    ELSE profiles.name
+                END,
+                headline = CASE
+                    WHEN excluded.payload_priority >= profiles.payload_priority
+                    THEN COALESCE(NULLIF(excluded.headline, ''), profiles.headline)
+                    ELSE profiles.headline
+                END,
+                email = COALESCE(NULLIF(excluded.email, ''), profiles.email),
+                phone = COALESCE(NULLIF(excluded.phone, ''), profiles.phone),
+                connected_since = COALESCE(NULLIF(excluded.connected_since, ''), profiles.connected_since),
+                contact_info_json = COALESCE(NULLIF(excluded.contact_info_json, ''), profiles.contact_info_json),
                 connection_status = COALESCE(NULLIF(excluded.connection_status, ''), profiles.connection_status),
                 connection_degree = COALESCE(NULLIF(excluded.connection_degree, ''), profiles.connection_degree),
                 source_tool = excluded.source_tool,
                 last_seen_at = excluded.last_seen_at,
-                payload_json = excluded.payload_json
+                payload_priority = MAX(profiles.payload_priority, excluded.payload_priority),
+                payload_json = CASE
+                    WHEN excluded.payload_priority >= profiles.payload_priority
+                    THEN excluded.payload_json
+                    ELSE profiles.payload_json
+                END
             """,
             (
                 profile_url,
                 str(profile.get("name") or ""),
                 str(profile.get("headline") or ""),
+                str(profile.get("email") or _first_string(contact_info.get("emails"))),
+                str(profile.get("phone") or _first_string(contact_info.get("phones"))),
+                str(profile.get("connected_since") or contact_info.get("connected_since") or ""),
+                _json(contact_info) if contact_info else "",
                 str(profile.get("connection_status") or ""),
                 str(profile.get("connection_degree") or ""),
                 tool_name,
                 observed_at,
                 observed_at,
+                payload_priority,
                 _json(profile.get("payload") or profile),
             ),
         )
@@ -488,6 +538,7 @@ class LocalCrmStore:
                     "name": post.get("author_name") or "",
                     "headline": post.get("author_headline") or "",
                     "payload": _trim_payload(post),
+                    "payload_priority": 40,
                 },
                 observed_at,
                 tool_run_id,
@@ -570,6 +621,7 @@ class LocalCrmStore:
                     "name": comment.get("commenter_name") or "",
                     "headline": comment.get("commenter_headline") or "",
                     "payload": _trim_payload(comment),
+                    "payload_priority": 40,
                 },
                 observed_at,
                 tool_run_id,
@@ -633,6 +685,7 @@ class LocalCrmStore:
                 "name": reactor.get("reactor_name") or "",
                 "headline": reactor.get("reactor_headline") or "",
                 "payload": _trim_payload(reactor),
+                "payload_priority": 40,
             },
             observed_at,
             tool_run_id,
@@ -782,6 +835,7 @@ def _iter_profiles(payload: Any) -> list[dict[str, Any]]:
                         or value.get("context")
                         or "",
                         "payload": _trim_payload(value),
+                        "payload_priority": 10,
                     }
                 )
             for child in value.values():
@@ -919,6 +973,28 @@ def _section_lines(result: dict[str, Any], section_name: str) -> list[str]:
     if not isinstance(text, str):
         return []
     return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def _extract_contact_info(result: dict[str, Any]) -> dict[str, Any]:
+    contact_info = result.get("contact_info")
+    if isinstance(contact_info, dict):
+        return contact_info
+    structured_sections = result.get("structured_sections")
+    if isinstance(structured_sections, dict) and isinstance(
+        structured_sections.get("contact_info"), dict
+    ):
+        return structured_sections["contact_info"]
+    return {}
+
+
+def _first_string(value: Any) -> str:
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, str) and item.strip():
+                return item.strip()
+    if isinstance(value, str):
+        return value.strip()
+    return ""
 
 
 def _normalize_profile_url(value: str) -> str:

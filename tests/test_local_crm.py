@@ -302,3 +302,78 @@ def test_local_crm_reactor_type_updates_without_duplicate(tmp_path):
             "reaction_type": "Like",
         }
     ]
+
+
+def test_local_crm_records_profile_contact_info_and_preserves_full_payload(tmp_path):
+    db_path = tmp_path / "crm.sqlite3"
+    store = LocalCrmStore(db_path)
+    profile_url = "https://www.linkedin.com/in/person/"
+    profile_payload = {
+        "url": profile_url,
+        "sections": {
+            "main_profile": "Person Name\n\n· 1st\n\nGeneral Counsel",
+            "contact_info": "Contact info\nEmail\nperson@example.com",
+        },
+        "connection": {
+            "status": "already_connected",
+            "degree": "1st",
+            "is_connected": True,
+            "is_pending": False,
+            "is_connectable": False,
+        },
+        "contact_info": {
+            "emails": ["person@example.com"],
+            "phones": ["+1 555 123 4567"],
+            "profile_urls": [profile_url],
+            "websites": [],
+            "connected_since": "Mar 26, 2026",
+        },
+        "references": {
+            "contact_info": [
+                {
+                    "kind": "person",
+                    "url": "/in/person/",
+                    "text": "Person Name",
+                }
+            ]
+        },
+    }
+
+    store.record_tool_result("get_person_profile", {}, profile_payload)
+    store.record_tool_result(
+        "feed_engagement",
+        {},
+        {
+            "references": {
+                "posts": [
+                    {
+                        "kind": "person",
+                        "url": "/in/person/",
+                        "text": "Reference Person",
+                        "context": "Reference-only headline",
+                    }
+                ]
+            }
+        },
+    )
+
+    profiles = _fetch_all(
+        db_path,
+        """
+        SELECT name, headline, email, phone, connected_since, contact_info_json,
+               payload_priority, payload_json
+        FROM profiles
+        WHERE profile_url = 'https://www.linkedin.com/in/person/'
+        """,
+    )
+
+    assert len(profiles) == 1
+    profile = profiles[0]
+    assert profile["name"] == "Person Name"
+    assert profile["headline"] == "· 1st"
+    assert profile["email"] == "person@example.com"
+    assert profile["phone"] == "+1 555 123 4567"
+    assert profile["connected_since"] == "Mar 26, 2026"
+    assert profile["payload_priority"] == 100
+    assert json.loads(profile["contact_info_json"]) == profile_payload["contact_info"]
+    assert json.loads(profile["payload_json"])["url"] == profile_url

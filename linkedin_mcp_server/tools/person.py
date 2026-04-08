@@ -43,16 +43,18 @@ def register_person_tools(mcp: FastMCP) -> None:
             linkedin_username: LinkedIn username (e.g., "stickerdaniel", "williamhgates")
             ctx: FastMCP context for progress reporting
             sections: Comma-separated list of extra sections to scrape.
-                The main profile page is always included.
+                The main profile page and contact-info overlay are always included.
                 Available sections: experience, education, interests, honors, languages, certifications, contact_info, posts
                 Examples: "experience,education", "contact_info", "certifications", "honors,languages", "posts"
-                Default (None) scrapes only the main profile page.
+                Default (None) scrapes the main profile page and contact-info overlay.
 
         Returns:
             Dict with url, sections (name -> raw text), connection metadata, and
             optional references.
             Sections may be absent if extraction yielded no content for that page.
             Includes unknown_sections list when unrecognised names are passed.
+            Includes contact_info with structured emails, phones, profile URLs,
+            websites, and connected_since when LinkedIn exposes them.
             The connection field includes status, degree, is_connected,
             is_pending, and is_connectable.
         """

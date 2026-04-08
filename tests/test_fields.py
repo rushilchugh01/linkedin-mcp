@@ -47,14 +47,14 @@ class TestCompanySections:
 
 
 class TestParsePersonSections:
-    def test_none_returns_baseline_only(self):
+    def test_none_returns_default_profile_sections(self):
         requested, unknown = parse_person_sections(None)
-        assert requested == {"main_profile"}
+        assert requested == {"main_profile", "contact_info"}
         assert unknown == []
 
-    def test_empty_string_returns_baseline_only(self):
+    def test_empty_string_returns_default_profile_sections(self):
         requested, unknown = parse_person_sections("")
-        assert requested == {"main_profile"}
+        assert requested == {"main_profile", "contact_info"}
         assert unknown == []
 
     def test_single_section(self):
@@ -64,27 +64,42 @@ class TestParsePersonSections:
 
     def test_multiple_sections(self):
         requested, unknown = parse_person_sections("experience,education")
-        assert requested == {"main_profile", "experience", "education"}
+        assert requested == {
+            "main_profile",
+            "contact_info",
+            "experience",
+            "education",
+        }
         assert unknown == []
 
     def test_invalid_names_returned(self):
         requested, unknown = parse_person_sections("experience,bogus,education")
-        assert requested == {"main_profile", "experience", "education"}
+        assert requested == {
+            "main_profile",
+            "contact_info",
+            "experience",
+            "education",
+        }
         assert unknown == ["bogus"]
 
     def test_multiple_invalid_names(self):
         requested, unknown = parse_person_sections("experience,foo,bar")
-        assert requested == {"main_profile", "experience"}
+        assert requested == {"main_profile", "contact_info", "experience"}
         assert unknown == ["foo", "bar"]
 
     def test_whitespace_and_case_handling(self):
         requested, unknown = parse_person_sections(" Experience , EDUCATION ")
-        assert requested == {"main_profile", "experience", "education"}
+        assert requested == {
+            "main_profile",
+            "contact_info",
+            "experience",
+            "education",
+        }
         assert unknown == []
 
     def test_baseline_passed_explicitly_not_unknown(self):
         requested, unknown = parse_person_sections("main_profile,experience")
-        assert requested == {"main_profile", "experience"}
+        assert requested == {"main_profile", "contact_info", "experience"}
         assert unknown == []
 
     def test_all_sections(self):
