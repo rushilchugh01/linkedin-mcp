@@ -103,6 +103,17 @@ class TestBootstrap:
         with pytest.raises(DockerHostLoginRequiredError):
             await ensure_tool_ready_or_raise("search_jobs")
 
+    async def test_cdp_browser_bypasses_docker_cookie_bootstrap(self, monkeypatch):
+        monkeypatch.setenv("BROWSER_CDP_ENDPOINT", "http://127.0.0.1:9223")
+        monkeypatch.setattr("linkedin_mcp_server.bootstrap._auth_ready", lambda: False)
+
+        initialize_bootstrap("docker")
+        await ensure_tool_ready_or_raise("search_feed_posts")
+
+        state = get_bootstrap_state()
+        assert state.setup_state is SetupState.READY
+        assert state.auth_state is AuthState.READY
+
     def test_reset_bootstrap_clears_state(self):
         initialize_bootstrap("managed")
         reset_bootstrap_for_testing()

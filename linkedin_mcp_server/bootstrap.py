@@ -292,6 +292,11 @@ async def ensure_tool_ready_or_raise(
     initialize_bootstrap()
     await _refresh_background_task_state()
 
+    if _using_cdp_browser():
+        _state.setup_state = SetupState.READY
+        _state.auth_state = AuthState.READY
+        return
+
     if get_runtime_policy() == RuntimePolicy.DOCKER:
         _raise_if_docker_auth_missing()
         return
@@ -325,6 +330,15 @@ def _raise_if_docker_auth_missing() -> None:
         return
     raise DockerHostLoginRequiredError(
         "No valid LinkedIn session is available in Docker. Run --login on the host machine to create a session, then retry this tool."
+    )
+
+
+def _using_cdp_browser() -> bool:
+    if os.environ.get("BROWSER_CDP_ENDPOINT"):
+        return True
+    return any(
+        arg == "--browser-cdp-endpoint" or arg.startswith("--browser-cdp-endpoint=")
+        for arg in sys.argv[1:]
     )
 
 
