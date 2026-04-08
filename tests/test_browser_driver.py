@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from linkedin_mcp_server.config.schema import AppConfig
+from linkedin_mcp_server.drivers import browser as browser_driver
 from linkedin_mcp_server.drivers.browser import (
     _feed_auth_succeeds,
     get_or_create_browser,
@@ -42,6 +43,7 @@ def _make_mock_browser() -> MagicMock:
     browser.close = AsyncMock()
     browser.page = MagicMock()
     browser.page.url = "https://www.linkedin.com/feed/"
+    browser.page.is_closed = MagicMock(return_value=False)
     browser.page.goto = AsyncMock()
     browser.page.set_default_timeout = MagicMock()
     browser.page.title = AsyncMock(return_value="LinkedIn")
@@ -118,6 +120,65 @@ async def test_get_or_create_browser_requires_source_state():
 
     with pytest.raises(AuthenticationError):
         await get_or_create_browser()
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_browser_attaches_cdp_without_source_state(
+    monkeypatch, tmp_path
+):
+    config = AppConfig()
+    config.browser.user_data_dir = str(tmp_path / "profile")
+    config.browser.cdp_endpoint = "http://127.0.0.1:9222"
+    cdp_browser = _make_mock_browser()
+
+    monkeypatch.setattr("linkedin_mcp_server.drivers.browser.get_config", lambda: config)
+    with (
+        patch(
+            "linkedin_mcp_server.drivers.browser.BrowserManager",
+            return_value=cdp_browser,
+        ) as ctor,
+        patch(
+            "linkedin_mcp_server.drivers.browser.detect_auth_barrier_quick",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+    ):
+        result = await get_or_create_browser()
+
+    assert result is cdp_browser
+    ctor.assert_called_once()
+    assert ctor.call_args.kwargs["cdp_endpoint"] == "http://127.0.0.1:9222"
+    assert ctor.call_args.kwargs["user_data_dir"] == tmp_path / "profile"
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_browser_discards_closed_cached_browser(tmp_path):
+    _write_source_state(tmp_path, runtime_id="macos-arm64-host")
+    stale_browser = _make_mock_browser()
+    stale_browser.page.is_closed.return_value = True
+    fresh_browser = _make_mock_browser()
+    browser_driver._browser = stale_browser
+    browser_driver._browser_cookie_export_path = portable_cookie_path(tmp_path / "profile")
+
+    with (
+        patch(
+            "linkedin_mcp_server.drivers.browser.get_runtime_id",
+            return_value="macos-arm64-host",
+        ),
+        patch(
+            "linkedin_mcp_server.drivers.browser.BrowserManager",
+            return_value=fresh_browser,
+        ),
+        patch(
+            "linkedin_mcp_server.drivers.browser.detect_auth_barrier_quick",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+    ):
+        result = await get_or_create_browser()
+
+    assert result is fresh_browser
+    stale_browser.close.assert_awaited_once()
 
 
 @pytest.mark.asyncio

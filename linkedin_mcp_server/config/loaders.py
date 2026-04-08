@@ -52,6 +52,7 @@ class EnvironmentKeys:
     VIEWPORT = "VIEWPORT"
     CHROME_PATH = "CHROME_PATH"
     USER_DATA_DIR = "USER_DATA_DIR"
+    BROWSER_CDP_ENDPOINT = "BROWSER_CDP_ENDPOINT"
 
 
 def is_interactive_environment() -> bool:
@@ -155,6 +156,10 @@ def load_from_env(config: AppConfig) -> AppConfig:
     if chrome_path_env := os.environ.get(EnvironmentKeys.CHROME_PATH):
         config.browser.chrome_path = chrome_path_env
 
+    # Attach to an already-running Chrome/Chromium with remote debugging enabled.
+    if cdp_endpoint_env := os.environ.get(EnvironmentKeys.BROWSER_CDP_ENDPOINT):
+        config.browser.cdp_endpoint = cdp_endpoint_env
+
     return config
 
 
@@ -244,6 +249,17 @@ def load_from_args(config: AppConfig) -> AppConfig:
         help="Path to Chrome/Chromium executable (for custom browser installations)",
     )
 
+    parser.add_argument(
+        "--browser-cdp-endpoint",
+        type=str,
+        default=None,
+        metavar="URL",
+        help=(
+            "Attach to an already-running Chrome/Chromium via CDP "
+            "(for example http://127.0.0.1:9222)"
+        ),
+    )
+
     # Session management
     parser.add_argument(
         "--login",
@@ -270,6 +286,120 @@ def load_from_args(config: AppConfig) -> AppConfig:
         metavar="PATH",
         help="Path to persistent browser profile directory (default: ~/.linkedin-mcp/profile)",
     )
+
+    subparsers = parser.add_subparsers(dest="cli_command")
+
+    post_details_parser = subparsers.add_parser(
+        "post-details",
+        help="Scrape details for one LinkedIn feed post URL",
+    )
+    post_details_parser.add_argument("post_url")
+    post_details_parser.add_argument("--output", type=str, default=None)
+
+    post_comments_parser = subparsers.add_parser(
+        "post-comments",
+        help="Scrape comments for one LinkedIn feed post URL",
+    )
+    post_comments_parser.add_argument("post_url")
+    post_comments_parser.add_argument("--limit", type=int, default=20)
+    post_comments_parser.add_argument("--output", type=str, default=None)
+
+    post_reactors_parser = subparsers.add_parser(
+        "post-reactors",
+        help="Scrape reactors for one LinkedIn feed post URL",
+    )
+    post_reactors_parser.add_argument("post_url")
+    post_reactors_parser.add_argument("--limit", type=int, default=50)
+    post_reactors_parser.add_argument("--reaction-type", type=str, default=None)
+    post_reactors_parser.add_argument("--output", type=str, default=None)
+
+    company_engagement_parser = subparsers.add_parser(
+        "company-engagement",
+        help="Scrape bounded recent post engagement for a LinkedIn company",
+    )
+    company_engagement_parser.add_argument("company_name")
+    company_engagement_parser.add_argument("--limit", type=int, default=3)
+    company_engagement_parser.add_argument(
+        "--comments",
+        dest="include_comments",
+        action="store_true",
+        default=True,
+        help="Include comments (default)",
+    )
+    company_engagement_parser.add_argument(
+        "--no-comments",
+        dest="include_comments",
+        action="store_false",
+        help="Skip comments",
+    )
+    company_engagement_parser.add_argument(
+        "--reactors",
+        dest="include_reactors",
+        action="store_true",
+        default=False,
+        help="Include reactors/likers",
+    )
+    company_engagement_parser.add_argument("--comment-limit", type=int, default=20)
+    company_engagement_parser.add_argument("--reactor-limit", type=int, default=0)
+    company_engagement_parser.add_argument("--reaction-type", type=str, default=None)
+    company_engagement_parser.add_argument("--output", type=str, default=None)
+
+    search_feed_parser = subparsers.add_parser(
+        "search-feed-posts",
+        help="Search the authenticated LinkedIn home feed for matching posts",
+    )
+    search_feed_parser.add_argument("--keyword", dest="keywords", action="append")
+    search_feed_parser.add_argument("--max-posts", type=int, default=10)
+    search_feed_parser.add_argument("--scrolls", type=int, default=10)
+    search_feed_parser.add_argument("--min-reactions", type=int, default=0)
+    search_feed_parser.add_argument("--min-comments", type=int, default=0)
+    search_feed_parser.add_argument(
+        "--include-promoted",
+        action="store_true",
+        default=False,
+        help="Include promoted feed posts",
+    )
+    search_feed_parser.add_argument("--output", type=str, default=None)
+
+    feed_engagement_parser = subparsers.add_parser(
+        "feed-engagement",
+        help="Search the home feed and enrich matching posts with engagement",
+    )
+    feed_engagement_parser.add_argument("--keyword", dest="keywords", action="append")
+    feed_engagement_parser.add_argument("--max-posts", type=int, default=5)
+    feed_engagement_parser.add_argument("--scrolls", type=int, default=10)
+    feed_engagement_parser.add_argument("--min-reactions", type=int, default=0)
+    feed_engagement_parser.add_argument("--min-comments", type=int, default=0)
+    feed_engagement_parser.add_argument(
+        "--include-promoted",
+        action="store_true",
+        default=False,
+        help="Include promoted feed posts",
+    )
+    feed_engagement_parser.add_argument(
+        "--comments",
+        dest="include_comments",
+        action="store_true",
+        default=True,
+        help="Include comments (default)",
+    )
+    feed_engagement_parser.add_argument(
+        "--no-comments",
+        dest="include_comments",
+        action="store_false",
+        help="Skip comments",
+    )
+    feed_engagement_parser.add_argument(
+        "--reactors",
+        dest="include_reactors",
+        action="store_true",
+        default=False,
+        help="Include reactors/likers",
+    )
+    feed_engagement_parser.add_argument("--comment-limit", type=int, default=20)
+    feed_engagement_parser.add_argument("--reactor-limit", type=int, default=0)
+    feed_engagement_parser.add_argument("--reaction-type", type=str, default=None)
+    feed_engagement_parser.add_argument("--output", type=str, default=None)
 
     args = parser.parse_args()
 
@@ -317,6 +447,9 @@ def load_from_args(config: AppConfig) -> AppConfig:
     if args.chrome_path:
         config.browser.chrome_path = args.chrome_path
 
+    if args.browser_cdp_endpoint:
+        config.browser.cdp_endpoint = args.browser_cdp_endpoint
+
     # Session management
     if args.login:
         config.server.login = True
@@ -329,6 +462,31 @@ def load_from_args(config: AppConfig) -> AppConfig:
 
     if args.user_data_dir:
         config.browser.user_data_dir = args.user_data_dir
+
+    if args.cli_command:
+        config.server.cli_command = args.cli_command
+        command_args = vars(args).copy()
+        for key in (
+            "no_headless",
+            "log_level",
+            "transport",
+            "host",
+            "port",
+            "path",
+            "slow_mo",
+            "user_agent",
+            "viewport",
+            "timeout",
+            "chrome_path",
+            "browser_cdp_endpoint",
+            "login",
+            "status",
+            "logout",
+            "user_data_dir",
+            "cli_command",
+        ):
+            command_args.pop(key, None)
+        config.server.cli_args = command_args
 
     return config
 

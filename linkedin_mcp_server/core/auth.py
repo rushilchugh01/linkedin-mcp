@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import random
 import re
 from urllib.parse import urlparse
 
@@ -10,6 +11,13 @@ from patchright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 from .exceptions import AuthenticationError
 
 logger = logging.getLogger(__name__)
+
+
+async def _auth_pace(reason: str) -> None:
+    """Short random delay after auth-related clicks (avoids circular import with scraping)."""
+    delay = random.uniform(5.0, 15.0)
+    logger.debug("auth pace %.1fs: %s", delay, reason)
+    await asyncio.sleep(delay)
 
 _AUTH_BLOCKER_URL_PATTERNS = (
     "/login",
@@ -225,10 +233,12 @@ async def resolve_remember_me_prompt(page: Page) -> bool:
 
         try:
             await target.click(timeout=5000)
+            await _auth_pace(reason="remember-me prompt click")
             logger.debug("Remember-me button click succeeded")
         except PlaywrightTimeoutError:
             logger.debug("Retrying remember-me prompt click with force=True")
             await target.click(timeout=5000, force=True)
+            await _auth_pace(reason="remember-me prompt force click")
             logger.debug("Remember-me button force-click succeeded")
         try:
             await page.wait_for_load_state("domcontentloaded", timeout=10000)

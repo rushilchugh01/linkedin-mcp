@@ -1,12 +1,13 @@
 import json
 import os
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from linkedin_mcp_server.bootstrap import (
     AuthState,
     _force_move_auth_state_aside,
+    browser_setup_ready,
     ensure_tool_ready_or_raise,
     get_bootstrap_state,
     get_runtime_policy,
@@ -50,7 +51,11 @@ class TestBootstrap:
         assert state.setup_task is not None
         await state.setup_task
 
-    async def test_setup_in_progress_raises(self):
+    async def test_setup_in_progress_raises(self, monkeypatch):
+        from linkedin_mcp_server.config.schema import AppConfig
+
+        config = AppConfig()
+        monkeypatch.setattr("linkedin_mcp_server.bootstrap.get_config", lambda: config)
         initialize_bootstrap("managed")
         state = get_bootstrap_state()
         state.setup_state = SetupState.RUNNING
@@ -140,6 +145,36 @@ class TestBootstrap:
     def test_runtime_policy_uses_initialized_value(self):
         initialize_bootstrap("managed")
         assert get_runtime_policy() == "managed"
+
+    def test_custom_chrome_path_marks_browser_setup_ready(self, monkeypatch, tmp_path):
+        from linkedin_mcp_server.config.schema import AppConfig
+
+        config = AppConfig()
+        config.browser.chrome_path = str(tmp_path / "chrome")
+        monkeypatch.setattr("linkedin_mcp_server.bootstrap.get_config", lambda: config)
+
+        assert browser_setup_ready() is True
+
+    async def test_custom_chrome_path_skips_background_setup_task(
+        self, monkeypatch, tmp_path
+    ):
+        from linkedin_mcp_server.config.schema import AppConfig
+
+        config = AppConfig()
+        config.browser.chrome_path = str(tmp_path / "chrome")
+        monkeypatch.setattr("linkedin_mcp_server.bootstrap.get_config", lambda: config)
+        run_setup = AsyncMock()
+        monkeypatch.setattr(
+            "linkedin_mcp_server.bootstrap._run_browser_setup", run_setup
+        )
+
+        initialize_bootstrap("managed")
+        await start_background_browser_setup_if_needed()
+
+        state = get_bootstrap_state()
+        assert state.setup_state is SetupState.READY
+        assert state.setup_task is None
+        run_setup.assert_not_called()
 
 
 def _make_auth_ready(profile_dir):

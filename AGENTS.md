@@ -15,6 +15,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Docker build: `docker build -t linkedin-mcp-server .`
 - Install browser: `uv run patchright install chromium`
 
+## Local Browser / Live LinkedIn Testing
+
+- On this workstation, run live LinkedIn browser tests from **Windows PowerShell**, not WSL.
+- Use the Windows repo path: `C:\NOS\Projects\others\linkedin-mcp`.
+- Use the repo-root Windows virtualenv: `.\.venv-win\Scripts\python.exe`.
+- Use Chrome explicitly: `--chrome-path "C:\Program Files\Google\Chrome\Application\chrome.exe"`.
+- Use the dedicated live-test profile: `--user-data-dir "$PWD\.linkedin-live-profile-win"`.
+- Add `$env:PYTHONIOENCODING="utf-8"` before Windows CLI commands so status output with Unicode symbols does not fail under the default code page.
+- Do not run Windows Python from a WSL heredoc or inline `python - <<'PY'` script for live browser work; it can leave interop-side processes stuck and may not surface the browser window.
+- Keep live outputs under ignored paths such as `data/` or `.tmp/`; do not print or commit real LinkedIn page text, profile names, comments, screenshots, cookies, or raw dumps.
+
+Example:
+
+```powershell
+Set-Location "C:\NOS\Projects\others\linkedin-mcp"
+$env:PYTHONIOENCODING = "utf-8"
+.\.venv-win\Scripts\python.exe -m linkedin_mcp_server `
+  --no-headless `
+  --chrome-path "C:\Program Files\Google\Chrome\Application\chrome.exe" `
+  --user-data-dir "$PWD\.linkedin-live-profile-win" `
+  company-engagement anthropicresearch --limit 1 --no-comments --output data\live-company.json
+```
+
 ## Scraping Rules
 
 - **One section = one navigation.** Each entry in `PERSON_SECTIONS` / `COMPANY_SECTIONS` (`scraping/fields.py`) maps to exactly one page navigation. Never combine multiple URLs behind a single section.

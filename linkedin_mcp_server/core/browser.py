@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from patchright.async_api import (
+    Browser,
     BrowserContext,
     Page,
     Playwright,
@@ -23,6 +24,17 @@ logger = logging.getLogger(__name__)
 _DEFAULT_USER_DATA_DIR = Path.home() / ".linkedin-mcp" / "profile"
 _PRIVATE_DIR_MODE = 0o700
 _PRIVATE_FILE_MODE = 0o600
+
+
+def _is_expected_closed_browser_error(exc: Exception) -> bool:
+    """Return true for Patchright/Windows pipe errors after the browser closes."""
+    message = str(exc)
+    return (
+        "Event loop is closed" in message
+        or "'NoneType' object has no attribute 'send'" in message
+        or "I/O operation on closed pipe" in message
+        or "Target page, context or browser has been closed" in message
+    )
 
 
 def _harden_linkedin_tree(path: Path) -> None:
@@ -60,6 +72,7 @@ class BrowserManager:
         slow_mo: int = 0,
         viewport: dict[str, int] | None = None,
         user_agent: str | None = None,
+        cdp_endpoint: str | None = None,
         **launch_options: Any,
     ):
         self.user_data_dir = str(Path(user_data_dir).expanduser())
@@ -67,9 +80,11 @@ class BrowserManager:
         self.slow_mo = slow_mo
         self.viewport = viewport or {"width": 1280, "height": 720}
         self.user_agent = user_agent
+        self.cdp_endpoint = cdp_endpoint
         self.launch_options = launch_options
 
         self._playwright: Playwright | None = None
+        self._browser: Browser | None = None
         self._context: BrowserContext | None = None
         self._page: Page | None = None
         self._is_authenticated = False
@@ -89,6 +104,10 @@ class BrowserManager:
             raise RuntimeError("Browser already started. Call close() first.")
         try:
             self._playwright = await async_playwright().start()
+
+            if self.cdp_endpoint:
+                await self._connect_over_cdp()
+                return
 
             secure_mkdir(Path(self.user_data_dir))
             _harden_linkedin_tree(Path(self.user_data_dir))
@@ -126,28 +145,78 @@ class BrowserManager:
             await self.close()
             raise NetworkError(f"Failed to start browser: {e}") from e
 
+    async def _connect_over_cdp(self) -> None:
+        """Attach to a user-owned Chrome instance exposed through CDP."""
+        if self._playwright is None:
+            raise RuntimeError("Playwright is not started")
+
+        self._browser = await self._playwright.chromium.connect_over_cdp(
+            self.cdp_endpoint,
+            slow_mo=self.slow_mo,
+            is_local=True,
+        )
+        if self._browser.contexts:
+            self._context = self._browser.contexts[0]
+        else:
+            context_options: dict[str, Any] = {
+                "viewport": self.viewport,
+                "locale": "en-US",
+            }
+            if self.user_agent:
+                context_options["user_agent"] = self.user_agent
+            self._context = await self._browser.new_context(**context_options)
+
+        for page in self._context.pages:
+            try:
+                if not page.is_closed():
+                    self._page = page
+                    break
+            except Exception:
+                continue
+        if self._page is None:
+            self._page = await self._context.new_page()
+
+        logger.info("Attached to existing browser via CDP endpoint %s", self.cdp_endpoint)
+
     async def close(self) -> None:
         """Close persistent context and cleanup resources."""
+        browser = self._browser
         context = self._context
         playwright = self._playwright
+        cdp_endpoint = self.cdp_endpoint
+        self._browser = None
         self._context = None
         self._page = None
         self._playwright = None
 
-        if context is None and playwright is None:
+        if context is None and playwright is None and browser is None:
             return
 
-        if context is not None:
+        if cdp_endpoint and browser is not None:
+            try:
+                await browser.close()
+            except Exception as exc:
+                if _is_expected_closed_browser_error(exc):
+                    logger.debug("CDP browser connection was already closed: %s", exc)
+                else:
+                    logger.error("Error closing CDP browser connection: %s", exc)
+        elif context is not None:
             try:
                 await context.close()
             except Exception as exc:
-                logger.error("Error closing browser context: %s", exc)
+                if _is_expected_closed_browser_error(exc):
+                    logger.debug("Browser context was already closed: %s", exc)
+                else:
+                    logger.error("Error closing browser context: %s", exc)
 
         if playwright is not None:
             try:
                 await playwright.stop()
             except Exception as exc:
-                logger.error("Error stopping playwright: %s", exc)
+                if _is_expected_closed_browser_error(exc):
+                    logger.debug("Playwright was already closed: %s", exc)
+                else:
+                    logger.error("Error stopping playwright: %s", exc)
 
         logger.info("Browser closed")
 
@@ -220,8 +289,11 @@ class BrowserManager:
             )
             logger.info("Exported %d LinkedIn cookies to %s", len(cookies), path)
             return True
-        except Exception:
-            logger.exception("Failed to export cookies")
+        except Exception as exc:
+            if _is_expected_closed_browser_error(exc):
+                logger.debug("Cookie export skipped because browser was already closed: %s", exc)
+            else:
+                logger.exception("Failed to export cookies")
             return False
 
     async def export_storage_state(

@@ -8,7 +8,7 @@ structure with type-safe configuration objects and default values.
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +21,7 @@ class ConfigurationError(Exception):
 class BrowserConfig:
     """Configuration for browser settings."""
 
-    headless: bool = True
+    headless: bool = False
     slow_mo: int = 0  # Milliseconds between browser actions (debugging)
     user_agent: str | None = None  # Custom browser user agent
     viewport_width: int = 1280
@@ -29,6 +29,7 @@ class BrowserConfig:
     default_timeout: int = 5000  # Milliseconds for page operations
     chrome_path: str | None = None  # Path to Chrome/Chromium executable
     user_data_dir: str = "~/.linkedin-mcp/profile"  # Persistent browser profile
+    cdp_endpoint: str | None = None  # Attach to an already-running Chrome via CDP
 
     def validate(self) -> None:
         """Validate browser configuration values."""
@@ -66,6 +67,8 @@ class ServerConfig:
     login: bool = False
     status: bool = False  # Check session validity and exit
     logout: bool = False
+    cli_command: str | None = None
+    cli_args: dict[str, Any] = field(default_factory=dict)
     # HTTP transport configuration
     host: str = "127.0.0.1"
     port: int = 8000

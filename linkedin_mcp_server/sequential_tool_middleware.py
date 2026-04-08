@@ -11,6 +11,8 @@ import mcp.types as mt
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.tools import ToolResult
 
+from linkedin_mcp_server.local_crm import record_tool_result
+
 logger = logging.getLogger(__name__)
 
 
@@ -62,7 +64,13 @@ class SequentialToolExecutionMiddleware(Middleware):
             )
             hold_started = time.perf_counter()
             try:
-                return await call_next(context)
+                result = await call_next(context)
+                record_tool_result(
+                    tool_name,
+                    dict(context.message.arguments or {}),
+                    _structured_tool_result(result),
+                )
+                return result
             finally:
                 hold_seconds = time.perf_counter() - hold_started
                 logger.debug(
@@ -70,3 +78,8 @@ class SequentialToolExecutionMiddleware(Middleware):
                     tool_name,
                     hold_seconds,
                 )
+
+
+def _structured_tool_result(result: ToolResult) -> object:
+    """Return the structured MCP payload when FastMCP exposes one."""
+    return getattr(result, "structured_content", None) or result

@@ -194,6 +194,7 @@ def register_messaging_tools(mcp: FastMCP) -> None:
         confirm_send: bool,
         ctx: Context,
         profile_urn: str | None = None,
+        recipient_name: str | None = None,
         extractor: Any | None = None,
     ) -> dict[str, Any]:
         """
@@ -212,6 +213,9 @@ def register_messaging_tools(mcp: FastMCP) -> None:
                 lookup and is more reliable when available. Obtain via
                 get_person_profile. Note: inbox may not always show all
                 messages; use search_conversations as a fallback.
+            recipient_name: Optional display name (first name is usually sufficient)
+                to open the compose page and type into the recipient picker directly.
+                When provided, skips loading the profile page entirely.
 
         Returns:
             Dict with url, status, message, recipient_selected, and sent.
@@ -233,6 +237,7 @@ def register_messaging_tools(mcp: FastMCP) -> None:
                 message,
                 confirm_send=confirm_send,
                 profile_urn=profile_urn,
+                recipient_name=recipient_name,
             )
 
             await ctx.report_progress(progress=100, total=100, message="Complete")

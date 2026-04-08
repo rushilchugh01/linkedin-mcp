@@ -33,6 +33,9 @@ def _make_mock_extractor(scrape_result: dict) -> MagicMock:
     mock.get_conversation = AsyncMock(return_value=scrape_result)
     mock.search_conversations = AsyncMock(return_value=scrape_result)
     mock.send_message = AsyncMock(return_value=scrape_result)
+    mock.get_post_details = AsyncMock(return_value=scrape_result)
+    mock.get_post_comments = AsyncMock(return_value=scrape_result)
+    mock.get_post_reactors = AsyncMock(return_value=scrape_result)
     mock.extract_page = AsyncMock(
         return_value=ExtractedSection(text="some text", references=[])
     )
@@ -244,6 +247,7 @@ class TestPersonTool:
         mock_extractor.connect_with_person.assert_awaited_once_with(
             "test-user",
             note="Let us connect.",
+            send_without_note=True,
         )
 
     async def test_connect_with_person_no_note(self, mock_context):
@@ -271,6 +275,7 @@ class TestPersonTool:
         mock_extractor.connect_with_person.assert_awaited_once_with(
             "test-user",
             note=None,
+            send_without_note=True,
         )
 
     async def test_connect_with_person_auth_error(self, monkeypatch):
@@ -643,7 +648,11 @@ class TestMessagingTools:
         assert result["status"] == "sent"
         assert result["sent"] is True
         mock_extractor.send_message.assert_awaited_once_with(
-            "testuser", "Hello!", confirm_send=True, profile_urn=None
+            "testuser",
+            "Hello!",
+            confirm_send=True,
+            profile_urn=None,
+            recipient_name=None,
         )
 
     async def test_send_message_with_profile_urn(self, mock_context):
@@ -673,7 +682,11 @@ class TestMessagingTools:
 
         assert result["status"] == "sent"
         mock_extractor.send_message.assert_awaited_once_with(
-            "testuser", "Hello!", confirm_send=True, profile_urn="ACoAAB1IelEB"
+            "testuser",
+            "Hello!",
+            confirm_send=True,
+            profile_urn="ACoAAB1IelEB",
+            recipient_name=None,
         )
 
     async def test_send_message_error(self, mock_context):
@@ -720,6 +733,11 @@ class TestToolTimeouts:
             "get_conversation",
             "search_conversations",
             "send_message",
+            "get_post_details",
+            "get_post_comments",
+            "get_post_reactors",
+            "search_feed_posts",
+            "browser_session_mode",
             "close_session",
         )
 
@@ -727,3 +745,23 @@ class TestToolTimeouts:
             tool = await mcp.get_tool(name)
             assert tool is not None
             assert tool.timeout == TOOL_TIMEOUT_SECONDS
+
+    async def test_company_engagement_has_dedicated_timeout(self):
+        from linkedin_mcp_server.constants import COMPANY_ENGAGEMENT_TIMEOUT_SECONDS
+        from linkedin_mcp_server.server import create_mcp_server
+
+        mcp = create_mcp_server()
+        tool = await mcp.get_tool("company_engagement")
+
+        assert tool is not None
+        assert tool.timeout == COMPANY_ENGAGEMENT_TIMEOUT_SECONDS
+
+    async def test_feed_engagement_has_dedicated_timeout(self):
+        from linkedin_mcp_server.constants import FEED_ENGAGEMENT_TIMEOUT_SECONDS
+        from linkedin_mcp_server.server import create_mcp_server
+
+        mcp = create_mcp_server()
+        tool = await mcp.get_tool("feed_engagement")
+
+        assert tool is not None
+        assert tool.timeout == FEED_ENGAGEMENT_TIMEOUT_SECONDS

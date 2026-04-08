@@ -7,7 +7,7 @@
   <a href="https://github.com/stickerdaniel/linkedin-mcp-server/blob/main/LICENSE" target="_blank"><img src="https://img.shields.io/badge/License-Apache%202.0-%233fb950?labelColor=32383f" alt="License"></a>
 </p>
 
-Through this LinkedIn MCP server, AI assistants like Claude can connect to your LinkedIn. Access profiles and companies, search for jobs, or get job details.
+Through this LinkedIn MCP server, AI assistants like Claude can connect to your LinkedIn. Access profiles and companies, search for jobs, get job details, and inspect bounded post engagement.
 
 ## Installation Methods
 
@@ -36,12 +36,24 @@ Suggest improvements for my CV to target this job posting https://www.linkedin.c
 What has Anthropic been posting about recently? https://www.linkedin.com/company/anthropicresearch/
 ```
 
+```
+Get comments for this LinkedIn post https://www.linkedin.com/feed/update/urn:li:activity:1234567890/
+```
+
+```
+Collect recent company post engagement for anthropicresearch, including comments but not reactors.
+```
+
+```
+Find legal AI posts in my home feed and collect up to 5 comments and 5 reactors from each matching post.
+```
+
 ## Features & Tool Status
 
 | Tool | Description | Status |
 |------|-------------|--------|
-| `get_person_profile` | Get profile info with explicit section selection (experience, education, interests, honors, languages, certifications, contact_info, posts) | working |
-| `connect_with_person` | Send a connection request or accept an incoming one, with optional note | [#304](https://github.com/stickerdaniel/linkedin-mcp-server/issues/304) |
+| `get_person_profile` | Get profile info with explicit section selection plus parsed connection metadata (`status`, `degree`, `is_connected`, `is_pending`, `is_connectable`) | working |
+| `connect_with_person` | Send a connection request or accept an incoming one, with optional note; this fork uses the Veridis top-card flow first instead of relying on upstream's older text/button flow | improved in fork |
 | `get_sidebar_profiles` | Extract profile URLs from sidebar recommendation sections ("More profiles for you", "Explore premium profiles", "People you may know") on a profile page | working |
 | `get_inbox` | List recent conversations from the LinkedIn messaging inbox | working |
 | `get_conversation` | Read a specific messaging conversation by username or thread ID | [#307](https://github.com/stickerdaniel/linkedin-mcp-server/issues/307) |
@@ -49,10 +61,114 @@ What has Anthropic been posting about recently? https://www.linkedin.com/company
 | `send_message` | Send a message to a LinkedIn user (requires confirmation) | working |
 | `get_company_profile` | Extract company information with explicit section selection (posts, jobs) | working |
 | `get_company_posts` | Get recent posts from a company's LinkedIn feed | working |
+| `get_post_details` | Get normalized details and engagement counts for one LinkedIn feed post URL | working |
+| `get_post_comments` | Get visible comments and commenter profile references for one LinkedIn feed post URL | working |
+| `get_post_reactors` | Get visible reactors/likers and reaction types for one LinkedIn feed post URL | working |
+| `company_engagement` | Collect bounded recent company post engagement with optional comments and reactors | working |
+| `search_feed_posts` | Search the authenticated home feed for matching post URLs using keywords, reaction/comment minimums, and scroll limits | working |
+| `feed_engagement` | Search the home feed and enrich matching posts with optional comments and reactors | working |
 | `search_jobs` | Search for jobs with keywords and location filters | working |
 | `search_people` | Search for people by keywords and location | working |
 | `get_job_details` | Get detailed information about a specific job posting | working |
+| `browser_session_mode` | Get or set headless/no-headless mode before opening the next browser session | working |
 | `close_session` | Close browser session and clean up resources | working |
+
+Post engagement tools are intentionally bounded and paced. Single-post tools use
+the global MCP tool timeout. `company_engagement` has a dedicated 5-minute
+server-side timeout, and `feed_engagement` has a dedicated 30-minute server-side
+timeout for large feed runs. Some MCP clients enforce their own shorter
+`tools/call` timeout (for example 120 seconds), so very large feed jobs may still
+need to be chunked or run through the direct CLI/HTTP paths.
+
+Post URLs are normalized from LinkedIn feed update URLs using
+`urn:li:activity`, `urn:li:share`, or `urn:li:ugcPost` IDs. This matters because
+LinkedIn may expose different URN types for home-feed posts in different
+sessions.
+
+### Connection request flow
+
+This fork intentionally uses the local Veridis connection-request behavior as
+the primary implementation for outgoing requests. The flow is a Python/Patchright
+port of `C:\NOS\Projects\veridis\scripts\send-connection-request.js`:
+
+- scroll to the top of the profile and scope actions to the visible profile
+  top-card section, avoiding sidebar/card pollution
+- detect `1st` and `Pending` states before clicking anything
+- click the direct `Invite ... to connect` action when present
+- fall back to the profile top-card `More` menu and choose `Connect` for
+  profiles where LinkedIn hides the primary action
+- click `Send without a note` by aria/text in standard or shadow DOM, then
+  verify `Pending` as a fallback
+
+`connect_with_person` defaults to `send_without_note=true`, so agents can pass a
+draft note for context without forcing the Premium-style note path. Set
+`send_without_note=false` only when you explicitly want to try adding a note.
+
+The original upstream text-detected button flow is still present only as a
+last-resort compatibility fallback for markup changes and tests. It should not
+be treated as the primary connection-request path in this fork.
+
+## Direct CLI Usage
+
+The post engagement workflows can also run directly without an MCP client or
+agent. These commands reuse the same Patchright browser profile and return JSON
+to stdout unless `--output` is provided. Reactors are opt-in and require a
+positive `--reactor-limit`.
+
+```bash
+uv run -m linkedin_mcp_server post-details "https://www.linkedin.com/feed/update/urn:li:activity:1234567890/"
+uv run -m linkedin_mcp_server post-comments "https://www.linkedin.com/feed/update/urn:li:activity:1234567890/" --limit 20
+uv run -m linkedin_mcp_server post-reactors "https://www.linkedin.com/feed/update/urn:li:activity:1234567890/" --limit 50
+uv run -m linkedin_mcp_server company-engagement anthropicresearch --limit 3 --comment-limit 20
+uv run -m linkedin_mcp_server company-engagement anthropicresearch --limit 3 --reactors --reactor-limit 25
+uv run -m linkedin_mcp_server search-feed-posts --keyword "legal ai" --max-posts 20 --scrolls 10 --output data/feed-posts.json
+uv run -m linkedin_mcp_server feed-engagement --keyword "legal ai" --max-posts 20 --scrolls 10 --comment-limit 5 --reactors --reactor-limit 5 --output data/feed-engagement.json
+```
+
+For large lead-generation runs, prefer batches such as 20-25 feed posts with
+small comment/reactor limits, then rank candidates and fetch deeper engagement
+only for the best posts. A single 100-post scrape with comments and reactors can
+exceed shorter MCP client timeouts even when the server-side tool timeout is
+longer.
+
+## Local CRM and Observability Store
+
+Local source checkouts record successful tool results into a local SQLite CRM
+database by default. Packaged/managed runtimes remain opt-in because this stores
+LinkedIn profile names, headlines, post text, comment text, and engagement
+relationships on disk.
+
+Local checkouts write to `data/local-crm.sqlite3` by default. Configure it with:
+
+```bash
+LINKEDIN_LOCAL_CRM=1  # force-enable outside a local source checkout
+LINKEDIN_LOCAL_CRM=0  # disable recording
+LINKEDIN_LOCAL_CRM_DB=~/.linkedin-mcp/crm.sqlite3  # optional override
+```
+
+When enabled, MCP tool calls and direct CLI commands record structured data into
+tables such as:
+
+- `tool_runs` for trimmed raw tool output snapshots
+- `visits` for observability events
+- `profiles`, `companies`, and `posts` for deduped entities
+- `comments` and `reactors` for post engagement text and people
+- `profile_post_edges` for relationships such as `author`, `commenter`, and
+  `reactor`
+- `company_post_edges` for relationships such as posts discovered from a
+  company page
+
+Profiles are deduped by normalized LinkedIn profile URL. Posts are deduped by
+normalized feed update URL. Comments keep `comment_text`, `like_count`, and
+`reply_count`. Posts keep `post_text` and engagement counts. The edge table makes
+queries like "show all posts this profile commented on" or "show every profile
+associated with this post" straightforward. Edge and visit rows also store the
+latest `tool_run_id`, so you can trace a CRM record back to a trimmed raw tool
+output snapshot.
+
+Privacy note: this database stores LinkedIn personal data locally on your
+machine. Keep it out of shared folders and do not sync it to git or cloud
+backups unless you explicitly want that data copied elsewhere.
 
 > [!IMPORTANT]
 > **Breaking change:** LinkedIn recently made some changes to prevent scraping. The newest version uses [Patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-python) with persistent browser profiles instead of Playwright with session files. Old `session.json` files and `LINKEDIN_COOKIE` env vars are no longer supported. Run `--login` again to create a new profile + cookie file that can be mounted in docker. 02/2026
@@ -155,6 +271,10 @@ parallel. Use `--log-level DEBUG` to see scraper lock wait/acquire/release logs.
 - Browser profile is stored at `~/.linkedin-mcp/profile/`
 - Managed browser downloads are cached at `~/.linkedin-mcp/patchright-browsers/`
 - Make sure you have only one active LinkedIn session at a time
+- A persistent Chrome profile can only be owned by one Patchright/Chrome
+  process. If startup fails with `Opening in existing browser session` followed
+  by `Target page, context or browser has been closed`, close other MCP/browser
+  sessions that are using the same `--user-data-dir`, then retry.
 
 **Login issues:**
 
@@ -166,6 +286,9 @@ parallel. Use `--log-level DEBUG` to see scraper lock wait/acquire/release logs.
 - If pages fail to load or elements aren't found, try increasing the timeout: `--timeout 10000`
 - Users on slow connections may need higher values (e.g., 15000-30000ms)
 - Can also set via environment variable: `TIMEOUT=10000`
+- `--timeout` controls browser page operations, not the MCP client's
+  `tools/call` wait time. Large `feed_engagement` calls may need smaller
+  batches if your client has a shorter hard timeout than the server-side tool.
 
 **Custom Chrome path:**
 
@@ -211,6 +334,9 @@ On startup, the MCP Bundle starts preparing the shared Patchright Chromium brows
 - If pages fail to load or elements aren't found, try increasing the timeout: `--timeout 10000`
 - Users on slow connections may need higher values (e.g., 15000-30000ms)
 - Can also set via environment variable: `TIMEOUT=10000`
+- `--timeout` controls browser page operations, not the MCP client's
+  `tools/call` wait time. Large `feed_engagement` calls may need smaller
+  batches if your client has a shorter hard timeout than the server-side tool.
 
 </details>
 
@@ -326,6 +452,9 @@ Runtime server logs are emitted by FastMCP/Uvicorn.
 - If pages fail to load or elements aren't found, try increasing the timeout: `--timeout 10000`
 - Users on slow connections may need higher values (e.g., 15000-30000ms)
 - Can also set via environment variable: `TIMEOUT=10000`
+- `--timeout` controls browser page operations, not the MCP client's
+  `tools/call` wait time. Large `feed_engagement` calls may need smaller
+  batches if your client has a shorter hard timeout than the server-side tool.
 
 **Custom Chrome path:**
 
@@ -433,6 +562,10 @@ uv run -m linkedin_mcp_server --transport streamable-http --host 127.0.0.1 --por
 
 - Browser profile is stored at `~/.linkedin-mcp/profile/`
 - Use `--logout` to clear the profile and start fresh
+- A persistent Chrome profile can only be owned by one Patchright/Chrome
+  process. If startup fails with `Opening in existing browser session` followed
+  by `Target page, context or browser has been closed`, close other MCP/browser
+  sessions that are using the same `--user-data-dir`, then retry.
 
 **Python/Patchright issues:**
 
@@ -445,6 +578,9 @@ uv run -m linkedin_mcp_server --transport streamable-http --host 127.0.0.1 --por
 - If pages fail to load or elements aren't found, try increasing the timeout: `--timeout 10000`
 - Users on slow connections may need higher values (e.g., 15000-30000ms)
 - Can also set via environment variable: `TIMEOUT=10000`
+- `--timeout` controls browser page operations, not the MCP client's
+  `tools/call` wait time. Large `feed_engagement` calls may need smaller
+  batches if your client has a shorter hard timeout than the server-side tool.
 
 **Custom Chrome path:**
 

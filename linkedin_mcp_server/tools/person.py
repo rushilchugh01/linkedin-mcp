@@ -49,10 +49,12 @@ def register_person_tools(mcp: FastMCP) -> None:
                 Default (None) scrapes only the main profile page.
 
         Returns:
-            Dict with url, sections (name -> raw text), and optional references.
+            Dict with url, sections (name -> raw text), connection metadata, and
+            optional references.
             Sections may be absent if extraction yielded no content for that page.
             Includes unknown_sections list when unrecognised names are passed.
-            The LLM should parse the raw text in each section.
+            The connection field includes status, degree, is_connected,
+            is_pending, and is_connectable.
         """
         try:
             extractor = extractor or await get_ready_extractor(
@@ -148,10 +150,19 @@ def register_person_tools(mcp: FastMCP) -> None:
         linkedin_username: str,
         ctx: Context,
         note: str | None = None,
+        send_without_note: bool = True,
         extractor: Any | None = None,
     ) -> dict[str, Any]:
         """
         Send a LinkedIn connection request or accept an incoming one.
+
+        Outgoing requests use this fork's Veridis-style profile top-card flow
+        first: it scopes buttons to the visible profile header, handles direct
+        Connect and More -> Connect, and uses the shadow-DOM "Send without a
+        note" confirmation when LinkedIn exposes it.
+        By default the tool sends without a note because many non-Premium
+        LinkedIn accounts cannot send personalized invites. Set
+        send_without_note=false to explicitly try the note flow.
 
         The tool is annotated with destructiveHint so MCP clients will
         prompt for user confirmation before execution.
@@ -160,6 +171,8 @@ def register_person_tools(mcp: FastMCP) -> None:
             linkedin_username: LinkedIn username (e.g., "stickerdaniel", "williamhgates")
             ctx: FastMCP context for progress reporting
             note: Optional note to include with the invitation
+            send_without_note: When true, ignore note and send using
+                "Send without a note"; defaults to true for non-Premium accounts
 
         Returns:
             Dict with url, status, message, and note_sent.
@@ -172,9 +185,10 @@ def register_person_tools(mcp: FastMCP) -> None:
                 ctx, tool_name="connect_with_person"
             )
             logger.info(
-                "Connecting with person: %s (note=%s)",
+                "Connecting with person: %s (note=%s, send_without_note=%s)",
                 linkedin_username,
                 note is not None,
+                send_without_note,
             )
 
             await ctx.report_progress(
@@ -186,6 +200,7 @@ def register_person_tools(mcp: FastMCP) -> None:
             result = await extractor.connect_with_person(
                 linkedin_username,
                 note=note,
+                send_without_note=send_without_note,
             )
 
             await ctx.report_progress(progress=100, total=100, message="Complete")

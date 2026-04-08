@@ -11,9 +11,10 @@ from linkedin_mcp_server.config.schema import (
 class TestBrowserConfig:
     def test_defaults(self):
         config = BrowserConfig()
-        assert config.headless is True
+        assert config.headless is False
         assert config.default_timeout == 5000
         assert config.user_data_dir == "~/.linkedin-mcp/profile"
+        assert config.cdp_endpoint is None
 
     def test_validate_passes(self):
         BrowserConfig().validate()  # No error
@@ -125,7 +126,7 @@ class TestLoaders:
         from linkedin_mcp_server.config.loaders import load_from_env
 
         config = load_from_env(AppConfig())
-        assert config.browser.headless is True  # default
+        assert config.browser.headless is False  # default
 
     def test_load_from_env_transport(self, monkeypatch):
         monkeypatch.setenv("TRANSPORT", "streamable-http")
@@ -207,3 +208,51 @@ class TestLoaders:
 
         config = load_from_env(AppConfig())
         assert config.browser.user_data_dir == "/custom/profile"
+
+    def test_load_from_env_browser_cdp_endpoint(self, monkeypatch):
+        monkeypatch.setenv("BROWSER_CDP_ENDPOINT", "http://127.0.0.1:9222")
+        from linkedin_mcp_server.config.loaders import load_from_env
+
+        config = load_from_env(AppConfig())
+        assert config.browser.cdp_endpoint == "http://127.0.0.1:9222"
+
+    def test_load_from_args_browser_cdp_endpoint(self, monkeypatch):
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "linkedin-mcp-server",
+                "--browser-cdp-endpoint",
+                "http://127.0.0.1:9222",
+            ],
+        )
+        from linkedin_mcp_server.config.loaders import load_from_args
+
+        config = load_from_args(AppConfig())
+        assert config.browser.cdp_endpoint == "http://127.0.0.1:9222"
+
+    def test_load_from_args_company_engagement_command(self, monkeypatch):
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "linkedin-mcp-server",
+                "--log-level",
+                "DEBUG",
+                "company-engagement",
+                "testcorp",
+                "--limit",
+                "2",
+                "--reactors",
+                "--reactor-limit",
+                "5",
+            ],
+        )
+        from linkedin_mcp_server.config.loaders import load_from_args
+
+        config = load_from_args(AppConfig())
+
+        assert config.server.log_level == "DEBUG"
+        assert config.server.cli_command == "company-engagement"
+        assert config.server.cli_args["company_name"] == "testcorp"
+        assert config.server.cli_args["limit"] == 2
+        assert config.server.cli_args["include_reactors"] is True
+        assert config.server.cli_args["reactor_limit"] == 5

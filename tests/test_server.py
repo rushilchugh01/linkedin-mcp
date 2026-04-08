@@ -1,5 +1,5 @@
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, call
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import mcp.types as mt
 from fastmcp import FastMCP
@@ -58,6 +58,22 @@ class TestSequentialToolExecutionMiddleware:
         result = await mcp.call_tool("simple_tool", {"value": 7})
 
         assert result.structured_content == {"value": 7}
+
+    async def test_sequential_tool_middleware_records_successful_tool_results(self):
+        mcp = FastMCP("test")
+        mcp.add_middleware(SequentialToolExecutionMiddleware())
+
+        @mcp.tool
+        async def simple_tool(value: int) -> dict[str, int]:
+            return {"value": value}
+
+        with patch(
+            "linkedin_mcp_server.sequential_tool_middleware.record_tool_result"
+        ) as record:
+            result = await mcp.call_tool("simple_tool", {"value": 7})
+
+        assert result.structured_content == {"value": 7}
+        record.assert_called_once_with("simple_tool", {"value": 7}, {"value": 7})
 
     async def test_sequential_tool_middleware_reports_queue_progress(self):
         middleware = SequentialToolExecutionMiddleware()

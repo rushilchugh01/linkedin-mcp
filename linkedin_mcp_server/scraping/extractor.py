@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import date, datetime
 import logging
+import random
 import re
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
@@ -34,6 +36,8 @@ from linkedin_mcp_server.scraping.link_metadata import (
     build_references,
     dedupe_references,
 )
+from linkedin_mcp_server.scraping.browser_pacing import BrowserPacer
+from linkedin_mcp_server.scraping.connection import detect_connection_metadata
 
 from .fields import COMPANY_SECTIONS, PERSON_SECTIONS
 
@@ -41,6 +45,7 @@ if TYPE_CHECKING:
     from linkedin_mcp_server.callbacks import ProgressCallback
 
 logger = logging.getLogger(__name__)
+_EXTRACTOR_PACER = BrowserPacer(logger_name=__name__)
 
 WaitUntil = Literal["commit", "domcontentloaded", "load", "networkidle"]
 
@@ -87,6 +92,19 @@ _WORK_TYPE_MAP = {"on_site": "1", "remote": "2", "hybrid": "3"}
 
 _SORT_BY_MAP = {"date": "DD", "relevance": "R"}
 
+_PROFILE_POST_AGE_LIMIT_DAYS = 365
+_RELATIVE_ACTIVITY_AGE_RE = re.compile(
+    r"(?<!\w)(?P<value>\d+)\s*"
+    r"(?P<unit>mo|mos|month|months|yr|yrs|year|years|w|wk|wks|week|weeks|d|day|days|h|hr|hrs|hour|hours|min|mins|m)"
+    r"(?!\w)",
+    re.IGNORECASE,
+)
+_ABSOLUTE_ACTIVITY_DATE_RE = re.compile(
+    r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+"
+    r"\d{1,2},\s+\d{4}\b",
+    re.IGNORECASE,
+)
+
 _DIALOG_SELECTOR = 'dialog[open], [role="dialog"]'
 _DIALOG_TEXTAREA_SELECTOR = '[role="dialog"] textarea, dialog textarea'
 
@@ -96,6 +114,8 @@ _MESSAGING_COMPOSE_SELECTOR = (
 )
 _MESSAGING_COMPOSE_FALLBACK_SELECTORS = (
     _MESSAGING_COMPOSE_SELECTOR,
+    'div[role="textbox"][contenteditable="true"]',
+    '[contenteditable="true"][aria-label*="message"]',
     'main div[role="textbox"][contenteditable="true"]',
     'main [contenteditable="true"][aria-label*="message"]',
 )
@@ -141,6 +161,65 @@ def _normalize_csv(value: str, mapping: dict[str, str]) -> str:
     """Normalize a comma-separated filter value using the provided mapping."""
     parts = [v.strip() for v in value.split(",")]
     return ",".join(mapping.get(p, p) for p in parts)
+
+
+def _filter_recent_activity_to_past_year(
+    text: str,
+    *,
+    today: date | None = None,
+) -> str:
+    """Keep reverse-chronological profile activity text within the past year."""
+    if not text.strip():
+        return text
+
+    current_date = today or date.today()
+    blocks = [block.strip() for block in re.split(r"\n\s*\n", text) if block.strip()]
+    if len(blocks) <= 1:
+        return _filter_recent_activity_lines_to_past_year(text, today=current_date)
+
+    kept: list[str] = []
+    for block in blocks:
+        if _activity_block_is_older_than_one_year(block, today=current_date):
+            break
+        kept.append(block)
+    return "\n\n".join(kept).strip()
+
+
+def _filter_recent_activity_lines_to_past_year(
+    text: str,
+    *,
+    today: date,
+) -> str:
+    kept: list[str] = []
+    for line in text.splitlines():
+        if _activity_block_is_older_than_one_year(line, today=today):
+            break
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
+def _activity_block_is_older_than_one_year(block: str, *, today: date) -> bool:
+    for match in _RELATIVE_ACTIVITY_AGE_RE.finditer(block):
+        value = int(match.group("value"))
+        unit = match.group("unit").lower()
+        if unit.startswith(("yr", "year")):
+            return value >= 1
+        if unit.startswith(("mo", "month")):
+            return value > 12
+
+    for match in _ABSOLUTE_ACTIVITY_DATE_RE.finditer(block):
+        raw_date = re.sub(r"\.", "", match.group(0))
+        try:
+            observed = datetime.strptime(raw_date, "%b %d, %Y").date()
+        except ValueError:
+            try:
+                observed = datetime.strptime(raw_date, "%B %d, %Y").date()
+            except ValueError:
+                continue
+        if (today - observed).days > _PROFILE_POST_AGE_LIMIT_DAYS:
+            return True
+
+    return False
 
 
 # Patterns that mark the start of LinkedIn page chrome (sidebar/footer).
@@ -478,6 +557,7 @@ class LinkedInExtractor:
             logger.debug("Scroll failed for button '%s'", text, exc_info=True)
         try:
             await target.click(timeout=timeout)
+            await _EXTRACTOR_PACER.after_click(reason=f"clicked '{text}'")
             return True
         except Exception:
             logger.debug("Click failed for button '%s'", text, exc_info=True)
@@ -506,6 +586,7 @@ class LinkedInExtractor:
         if count == 0:
             return False
         await buttons.nth(count - 1).click(timeout=timeout)
+        await _EXTRACTOR_PACER.after_click(reason="dialog primary button click")
         return True
 
     async def _fill_dialog_textarea(self, value: str, *, timeout: int = 5000) -> bool:
@@ -541,6 +622,7 @@ class LinkedInExtractor:
             if await more_btn.count() == 0:
                 return False
             await more_btn.first.click()
+            await _EXTRACTOR_PACER.after_click(reason="profile More menu click")
         except Exception:
             logger.debug("Could not click More button", exc_info=True)
             return False
@@ -590,6 +672,7 @@ class LinkedInExtractor:
         except Exception:
             logger.debug("Could not scroll %s into view", selector, exc_info=True)
         await target.click(timeout=timeout)
+        await _EXTRACTOR_PACER.after_click(reason=f"click first selector {selector}")
 
     async def _wait_for_main_text(
         self,
@@ -617,9 +700,18 @@ class LinkedInExtractor:
         *,
         position: Literal["top", "bottom"],
         attempts: int,
-        pause_time: float = 0.5,
+        pause_time: float | None = None,
+        min_pause_time: float = 2.0,
+        max_pause_time: float = 4.0,
     ) -> None:
         """Scroll the largest scrollable region inside main when one exists."""
+        if pause_time is not None:
+            logger.debug(
+                "Ignoring fixed main-region pause_time=%s; using randomized %.1f-%.1fs pause",
+                pause_time,
+                min_pause_time,
+                max_pause_time,
+            )
         for _ in range(attempts):
             await self._page.evaluate(
                 """({ position }) => {
@@ -643,7 +735,13 @@ class LinkedInExtractor:
                 }""",
                 {"position": position},
             )
-            await asyncio.sleep(pause_time)
+            delay = random.uniform(min_pause_time, max_pause_time)
+            logger.debug(
+                "main-region %s scroll: randomized post-scroll pause %.2fs",
+                position,
+                delay,
+            )
+            await asyncio.sleep(delay)
 
     async def extract_page(
         self,
@@ -736,9 +834,9 @@ class LinkedInExtractor:
 
         # Scroll to trigger lazy loading
         if is_activity:
-            await scroll_to_bottom(self._page, pause_time=1.0, max_scrolls=10)
+            await scroll_to_bottom(self._page, max_scrolls=10)
         else:
-            await scroll_to_bottom(self._page, pause_time=0.5, max_scrolls=5)
+            await scroll_to_bottom(self._page, max_scrolls=5)
 
         # Extract text from main content area
         raw_result = await self._extract_root_content(["main"])
@@ -881,6 +979,14 @@ class LinkedInExtractor:
                         extracted = await self.extract_page(
                             url, section_name=section_name
                         )
+                        if section_name == "posts" and extracted.text:
+                            extracted = ExtractedSection(
+                                text=_filter_recent_activity_to_past_year(
+                                    extracted.text
+                                ),
+                                references=extracted.references,
+                                error=extracted.error,
+                            )
 
                     if extracted.text and extracted.text != _RATE_LIMITED_MSG:
                         sections[section_name] = extracted.text
@@ -918,6 +1024,9 @@ class LinkedInExtractor:
             "url": f"{base_url}/",
             "sections": sections,
         }
+        main_profile_text = sections.get("main_profile", "")
+        if main_profile_text:
+            result["connection"] = detect_connection_metadata(main_profile_text)
         if profile_urn:
             result["profile_urn"] = profile_urn
         if references:
@@ -930,26 +1039,88 @@ class LinkedInExtractor:
 
         return result
 
+    async def get_post_details(self, post_url: str) -> dict[str, Any]:
+        """Scrape details for one LinkedIn feed post URL."""
+        from linkedin_mcp_server.scraping.post import scrape_post_details
+
+        logger.info("Extractor get_post_details started: post_url=%s", post_url)
+        return await scrape_post_details(self, post_url)
+
+    async def get_post_comments(
+        self,
+        post_url: str,
+        *,
+        limit: int | None = 20,
+    ) -> dict[str, Any]:
+        """Scrape visible comments for one LinkedIn feed post URL."""
+        from linkedin_mcp_server.scraping.post import scrape_post_comments
+
+        logger.info(
+            "Extractor get_post_comments started: post_url=%s limit=%s",
+            post_url,
+            limit,
+        )
+        return await scrape_post_comments(self, post_url, limit=limit)
+
+    async def get_post_reactors(
+        self,
+        post_url: str,
+        *,
+        limit: int | None = 50,
+        reaction_type: str | None = None,
+    ) -> dict[str, Any]:
+        """Scrape visible reactors for one LinkedIn feed post URL."""
+        from linkedin_mcp_server.scraping.post import scrape_post_reactors
+
+        logger.info(
+            "Extractor get_post_reactors started: post_url=%s limit=%s reaction_type=%s",
+            post_url,
+            limit,
+            reaction_type,
+        )
+        return await scrape_post_reactors(
+            self,
+            post_url,
+            limit=limit,
+            reaction_type=reaction_type,
+        )
+
     async def connect_with_person(
         self,
         username: str,
         *,
         note: str | None = None,
+        send_without_note: bool = True,
     ) -> dict[str, Any]:
         """Send a LinkedIn connection request or accept an incoming one.
 
-        Scrapes the profile page, parses the action area text to detect
-        the connection state, then clicks the appropriate button.  Dialog
-        interaction uses structural CSS selectors — no hardcoded button text.
+        Scrapes the profile page, then uses this fork's Veridis-style top-card
+        flow for outgoing connection requests. The older text-detected button
+        flow is retained only as a compatibility fallback when the top-card DOM
+        is unavailable in tests or LinkedIn changes the profile markup.
+        By default, notes are ignored and the flow uses "Send without a note"
+        for non-Premium LinkedIn accounts.
         """
         from linkedin_mcp_server.scraping.connection import (
             STATE_BUTTON_MAP,
             detect_connection_state,
         )
+        from linkedin_mcp_server.scraping.connection_request import (
+            click_add_note_button,
+            click_profile_connect_action,
+            click_shadow_send_without_note,
+            dismiss_connection_confirmation,
+            profile_has_pending_state,
+        )
 
         url = f"https://www.linkedin.com/in/{username}/"
+        if send_without_note and note:
+            logger.info(
+                "Ignoring connection note for %s because send_without_note=true",
+                username,
+            )
+            note = None
 
-        # Scrape the profile to get the page text
         profile = await self.scrape_person(username, {"main_profile"})
         page_text = profile.get("sections", {}).get("main_profile", "")
         if not page_text:
@@ -957,7 +1128,6 @@ class LinkedInExtractor:
                 url, "unavailable", "Could not read profile page."
             )
 
-        # Detect state from the scraped text
         state = detect_connection_state(page_text)
         logger.info("Connection state for %s: %s", username, state)
 
@@ -975,105 +1145,225 @@ class LinkedInExtractor:
                 "A connection request is already pending for this profile.",
                 profile=page_text,
             )
-        via_more_menu = False
-        if state == "follow_only":
-            # Connect may be hidden behind the More (three-dot) menu
-            if await self._open_more_menu():
-                state = "connectable"
-                via_more_menu = True
-            else:
+
+        async def fallback_text_flow(reason: str) -> dict[str, Any]:
+            """Use the existing text-detected button flow as a compatibility path."""
+            logger.info(
+                "Using text-based connection fallback for %s: %s", username, reason
+            )
+            fallback_state = state
+            via_more_menu = False
+            if fallback_state == "follow_only":
+                if await self._open_more_menu():
+                    fallback_state = "connectable"
+                    via_more_menu = True
+                else:
+                    return _connection_result(
+                        url,
+                        "follow_only",
+                        "This profile currently exposes Follow but not Connect.",
+                        profile=page_text,
+                    )
+
+            if fallback_state == "unavailable":
                 return _connection_result(
                     url,
-                    "follow_only",
-                    "This profile currently exposes Follow but not Connect.",
+                    "connect_unavailable",
+                    "LinkedIn did not expose a usable Connect action for this profile.",
                     profile=page_text,
                 )
 
-        if state == "unavailable":
-            return _connection_result(
-                url,
-                "connect_unavailable",
-                "LinkedIn did not expose a usable Connect action for this profile.",
-                profile=page_text,
-            )
-
-        # state is "connectable" or "incoming_request"
-        button_text = STATE_BUTTON_MAP.get(state)
-        if not button_text:
-            return _connection_result(
-                url,
-                "connect_unavailable",
-                f"No button mapping for state '{state}'.",
-            )
-
-        # Click the button (page is already loaded from scrape_person)
-        click_scope = "[role='menu']" if via_more_menu else "main"
-        clicked = await self.click_button_by_text(button_text, scope=click_scope)
-        if not clicked:
-            return _connection_result(
-                url,
-                "send_failed",
-                f"Could not find or click button '{button_text}'.",
-            )
-
-        # ---- Handle dialog (structural selectors only) ----
-        # Only wait for a dialog when sending a Connect request (Accept
-        # typically completes immediately without a dialog).
-        if state == "connectable":
-            try:
-                await self._page.wait_for_selector(_DIALOG_SELECTOR)
-            except PlaywrightTimeoutError:
-                logger.debug("No dialog appeared after clicking '%s'", button_text)
-
-        note_sent = False
-        if note and await self._dialog_is_open():
-            # Try to find textarea directly; if not visible, click the first
-            # button in the dialog (typically "Add a note") to reveal it
-            textarea_count = await self._page.locator(_DIALOG_TEXTAREA_SELECTOR).count()
-            if textarea_count == 0:
-                buttons = self._page.locator(
-                    f"{_DIALOG_SELECTOR} button, {_DIALOG_SELECTOR} [role='button']"
-                )
-                if await buttons.count() > 1:
-                    await buttons.first.click()
-
-            filled = await self._fill_dialog_textarea(note)
-            if filled:
-                note_sent = True
-            else:
-                await self._dismiss_dialog()
+            button_text = STATE_BUTTON_MAP.get(fallback_state)
+            if not button_text:
                 return _connection_result(
                     url,
-                    "note_not_supported",
-                    "LinkedIn did not offer note entry for this connection flow.",
+                    "connect_unavailable",
+                    f"No button mapping for state '{fallback_state}'.",
                 )
 
-        # Click the primary (Send) button if a dialog is still open
-        if await self._dialog_is_open():
-            sent = await self._click_dialog_primary_button()
-            if not sent:
-                await self._dismiss_dialog()
+            click_scope = "[role='menu']" if via_more_menu else "main"
+            clicked = await self.click_button_by_text(button_text, scope=click_scope)
+            if not clicked:
                 return _connection_result(
-                    url, "send_failed", "Could not find the send button in the dialog."
+                    url,
+                    "send_failed",
+                    f"Could not find or click button '{button_text}'.",
                 )
-            # Wait for dialog to close
-            try:
-                await self._page.wait_for_selector(_DIALOG_SELECTOR, state="hidden")
-            except PlaywrightTimeoutError:
-                logger.debug("Dialog did not close after clicking send")
+            return await finish_connection_dialog(fallback_state)
 
-        # Read the current page text (already on the profile after the action)
-        updated_text = await self.get_page_text()
+        async def finish_connection_dialog(final_state: str) -> dict[str, Any]:
+            """Complete any connection dialog and verify the resulting state."""
+            if final_state == "connectable":
+                try:
+                    await self._page.wait_for_selector(_DIALOG_SELECTOR, timeout=3000)
+                except PlaywrightTimeoutError:
+                    logger.debug("No standard dialog appeared for %s", username)
 
-        status = "accepted" if state == "incoming_request" else "connected"
+            note_sent = False
+            dialog_open = await self._dialog_is_open()
+            if note and dialog_open:
+                textarea_count = await self._page.locator(
+                    _DIALOG_TEXTAREA_SELECTOR
+                ).count()
+                if textarea_count == 0:
+                    await click_add_note_button(self._page)
+
+                filled = await self._fill_dialog_textarea(note)
+                if filled:
+                    note_sent = True
+                else:
+                    if await click_shadow_send_without_note(self._page):
+                        updated_text = await self.get_page_text()
+                        return _connection_result(
+                            url,
+                            "connected",
+                            "Connection request sent without note because LinkedIn did not expose note entry.",
+                            note_sent=False,
+                            profile=updated_text,
+                        )
+                    await self._dismiss_dialog()
+                    await dismiss_connection_confirmation(self._page)
+                    return _connection_result(
+                        url,
+                        "note_not_supported",
+                        "LinkedIn did not offer note entry for this connection flow.",
+                    )
+
+            dialog_open = await self._dialog_is_open()
+            if dialog_open:
+                sent = False
+                if final_state == "connectable" and not note_sent:
+                    sent = await click_shadow_send_without_note(self._page)
+                if not sent:
+                    sent = await self._click_dialog_primary_button()
+                if not sent:
+                    await self._dismiss_dialog()
+                    return _connection_result(
+                        url,
+                        "send_failed",
+                        "Could not find the send button in the dialog.",
+                    )
+                try:
+                    await self._page.wait_for_selector(
+                        _DIALOG_SELECTOR, state="hidden", timeout=3000
+                    )
+                except PlaywrightTimeoutError:
+                    logger.debug("Dialog did not close after clicking send")
+
+            elif final_state == "connectable":
+                if note:
+                    if await profile_has_pending_state(self._page):
+                        logger.info(
+                            "Connection flow for %s already appears pending without note entry",
+                            username,
+                        )
+                        updated_text = await self.get_page_text()
+                        return _connection_result(
+                            url,
+                            "connected",
+                            "Connection request sent, but LinkedIn did not offer note entry.",
+                            note_sent=False,
+                            profile=updated_text,
+                        )
+                    await dismiss_connection_confirmation(self._page)
+                    return _connection_result(
+                        url,
+                        "note_not_supported",
+                        "LinkedIn did not offer note entry for this connection flow.",
+                    )
+
+                if await click_shadow_send_without_note(self._page):
+                    logger.info("Connection request sent via shadow-DOM button")
+                elif await profile_has_pending_state(self._page):
+                    logger.info("Connection request appears pending without a dialog")
+                else:
+                    logger.info(
+                        "No send dialog or pending state found for %s", username
+                    )
+                    return _connection_result(
+                        url,
+                        "send_failed",
+                        "Could not find the connection request confirmation dialog.",
+                    )
+
+            updated_text = await self.get_page_text()
+            status = "accepted" if final_state == "incoming_request" else "connected"
+            return _connection_result(
+                url,
+                status,
+                "Connection request sent."
+                if status == "connected"
+                else "Connection request accepted.",
+                note_sent=note_sent,
+                profile=updated_text,
+            )
+
+        if state == "incoming_request":
+            button_text = STATE_BUTTON_MAP.get(state)
+            if not button_text:
+                return _connection_result(
+                    url,
+                    "connect_unavailable",
+                    f"No button mapping for state '{state}'.",
+                )
+            clicked = await self.click_button_by_text(button_text, scope="main")
+            if not clicked:
+                return _connection_result(
+                    url,
+                    "send_failed",
+                    f"Could not find or click button '{button_text}'.",
+                )
+            return await finish_connection_dialog(state)
+
+        top_card_result = await click_profile_connect_action(self._page)
+        top_card_status = top_card_result.get("status")
+        logger.info(
+            "Top-card connection flow for %s returned status=%s",
+            username,
+            top_card_status,
+        )
+
+        if top_card_status == "already_connected":
+            return _connection_result(
+                url,
+                "already_connected",
+                "You are already connected with this profile.",
+                profile=page_text,
+            )
+        if top_card_status == "pending":
+            return _connection_result(
+                url,
+                "pending",
+                "A connection request is already pending for this profile.",
+                profile=page_text,
+            )
+        if top_card_status in {"clicked_direct", "clicked_more"}:
+            return await finish_connection_dialog("connectable")
+
+        if top_card_status == "no_more_button" and state == "follow_only":
+            return _connection_result(
+                url,
+                "follow_only",
+                "This profile currently exposes Follow but not Connect.",
+                profile=page_text,
+            )
+        if top_card_status in {"no_profile_section", "no_more_button", "error"}:
+            return await fallback_text_flow(str(top_card_status))
+        if top_card_status == "connect_not_found":
+            if state == "unavailable":
+                return _connection_result(
+                    url,
+                    "connect_unavailable",
+                    "LinkedIn did not expose a usable Connect action for this profile.",
+                    profile=page_text,
+                )
+            return await fallback_text_flow("connect_not_found")
+
         return _connection_result(
             url,
-            status,
-            "Connection request sent."
-            if status == "connected"
-            else "Connection request accepted.",
-            note_sent=note_sent,
-            profile=updated_text,
+            "connect_unavailable",
+            "LinkedIn did not expose a usable Connect action for this profile.",
+            profile=page_text,
         )
 
     async def _extract_profile_urn(self) -> str | None:
@@ -1295,7 +1585,16 @@ class LinkedInExtractor:
         )
         if not isinstance(href, str) or not href.strip():
             return None
-        return urljoin("https://www.linkedin.com", href.strip())
+        url = urljoin("https://www.linkedin.com", href.strip())
+        # The profile page Message button includes interop=msgOverlay which
+        # causes LinkedIn to render a minimal overlay instead of the full
+        # compose page.  Strip it so we always get the full-page compose UI.
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query)
+        recipient = qs.get("recipient", [None])[0]
+        if recipient:
+            return f"https://www.linkedin.com/messaging/compose/?recipient={recipient}"
+        return url
 
     async def _read_profile_display_name(self) -> str | None:
         """Read the visible profile name from the current person page."""
@@ -1327,19 +1626,24 @@ class LinkedInExtractor:
     async def _wait_for_message_surface(
         self,
     ) -> Literal["composer", "recipient_picker"] | None:
-        """Wait for either the recipient picker or the real composer to appear.
+        """Detect whether the compose page shows a recipient picker or composer.
 
-        The recipient-picker probe uses a short 2 s cap so we fall through
-        quickly to the composer check, which uses the page-level default
-        (``BrowserConfig.default_timeout``, configurable via ``--timeout``).
+        Quick probe only — the heavy wait happens in _resolve_message_compose_box.
         """
         if await self._locator_is_visible(
             _MESSAGING_RECIPIENT_PICKER_SELECTOR, timeout=2000
         ):
             return "recipient_picker"
-        if await self._wait_for_message_composer():
-            return "composer"
-        return None
+        # Quick JS check — don't do a full 30s wait here; that happens later.
+        found = await self._page.evaluate(
+            """() => {
+                const el =
+                    document.querySelector('.msg-form__contenteditable[contenteditable="true"]') ||
+                    document.querySelector('div[role="textbox"][contenteditable="true"]');
+                return !!el;
+            }"""
+        )
+        return "composer" if found else None
 
     async def _select_message_recipient(self, *candidates: str) -> bool:
         """Select the intended recipient from LinkedIn's New message picker."""
@@ -1403,7 +1707,7 @@ class LinkedInExtractor:
             {"candidates": normalized_candidates},
         )
         if selected:
-            await asyncio.sleep(0.75)
+            await _EXTRACTOR_PACER.after_click(reason="message recipient selection")
         return bool(selected)
 
     async def _wait_for_message_composer(self) -> bool:
@@ -1411,37 +1715,32 @@ class LinkedInExtractor:
         return await self._resolve_message_compose_box() is not None
 
     async def _resolve_message_compose_box(self) -> Any | None:
-        """Resolve the visible compose box used for writing a LinkedIn message.
-
-        Uses the page-level default timeout (``BrowserConfig.default_timeout``)
-        so the ``--timeout`` CLI flag is respected.
-        """
-        for selector in _MESSAGING_COMPOSE_FALLBACK_SELECTORS:
-            locator = self._page.locator(selector)
-            candidate_count: int | None = None
-            try:
-                candidate_count = await locator.count()
-            except Exception:
-                logger.debug(
-                    "Could not count compose box candidates for selector %r",
-                    selector,
-                    exc_info=True,
-                )
-
-            logger.debug(
-                "Message compose selector %r matched %s candidate(s)",
-                selector,
-                candidate_count if candidate_count is not None else "unknown",
+        """Resolve the visible compose box used for writing a LinkedIn message."""
+        _COMPOSE_SELECTOR = (
+            '.msg-form__contenteditable[contenteditable="true"], '
+            'div[role="textbox"][contenteditable="true"][aria-label*="Write a message"]'
+        )
+        try:
+            await self._page.wait_for_selector(
+                _COMPOSE_SELECTOR, state="attached", timeout=30000
             )
+        except PlaywrightTimeoutError:
+            logger.info("Compose textbox never appeared in DOM (30s)")
+            return None
 
-            candidate = locator.last
-            try:
-                await candidate.wait_for(state="visible")
-                return candidate
-            except PlaywrightTimeoutError:
-                continue
-
-        return None
+        handle = await self._page.evaluate_handle(
+            """() => {
+                const el =
+                    document.querySelector('.msg-form__contenteditable[contenteditable="true"]') ||
+                    document.querySelector('div[role="textbox"][contenteditable="true"][aria-label*="Write a message"]') ||
+                    document.querySelector('div[role="textbox"][contenteditable="true"]');
+                return el || null;
+            }"""
+        )
+        element = handle.as_element()
+        if element is None:
+            logger.info("Compose textbox in DOM but JS handle returned null")
+        return element
 
     async def _compose_page_matches_recipient(self, *candidates: str) -> bool:
         """Verify the compose page visibly identifies the intended recipient."""
@@ -1462,7 +1761,7 @@ class LinkedInExtractor:
                     );
 
                 const targetValues = candidates.map(normalize).filter(Boolean);
-                const root = document.querySelector('main') || document.body;
+                const root = document.body;
                 if (!root) return false;
 
                 const entries = Array.from(
@@ -1536,10 +1835,11 @@ class LinkedInExtractor:
         search_input = self._page.get_by_role("searchbox")
         await search_input.wait_for()
         await search_input.click()
+        await _EXTRACTOR_PACER.after_click(reason="messaging searchbox click")
         await self._page.keyboard.type(search_query, delay=30)
-        await asyncio.sleep(1.0)
+        await _EXTRACTOR_PACER.after_click(reason="messaging search query typed")
         await self._page.keyboard.press("Enter")
-        await asyncio.sleep(1.5)
+        await _EXTRACTOR_PACER.after_click(reason="messaging search enter press")
         await self._wait_for_main_text(log_context="Messaging search results")
 
         match_result = await self._page.evaluate(
@@ -1609,7 +1909,7 @@ class LinkedInExtractor:
         if not isinstance(match_result, dict) or not match_result.get("clicked"):
             return None
 
-        await asyncio.sleep(1.0)
+        await _EXTRACTOR_PACER.after_click(reason="messaging search result click")
         current_thread_id = self._extract_thread_id(self._page.url)
         if current_thread_id and current_thread_id != baseline_thread_id:
             return self._page.url
@@ -1842,7 +2142,7 @@ class LinkedInExtractor:
 
         await handle_modal_close(self._page)
         if main_found:
-            await scroll_job_sidebar(self._page, pause_time=0.5, max_scrolls=5)
+            await scroll_job_sidebar(self._page, max_scrolls=5)
 
         raw_result = await self._extract_root_content(["main"])
         raw = raw_result["text"]
@@ -2122,9 +2422,7 @@ class LinkedInExtractor:
         await handle_modal_close(self._page)
 
         scrolls = max(1, limit // 10)
-        await self._scroll_main_scrollable_region(
-            position="bottom", attempts=scrolls, pause_time=0.5
-        )
+        await self._scroll_main_scrollable_region(position="bottom", attempts=scrolls)
 
         raw_result = await self._extract_root_content(["main"])
         raw = raw_result["text"]
@@ -2153,48 +2451,72 @@ class LinkedInExtractor:
         LinkedIn's conversation sidebar renders ``<li>`` items with JS click
         handlers — no ``<a href>`` tags — so the only reliable way to obtain
         thread IDs is to click each item and read the SPA URL change.
+
+        Clicking is done in Python (one click per iteration with a Python-side
+        delay) rather than in a single ``page.evaluate`` JS loop.  When a SPA
+        navigation fires inside ``page.evaluate``, the browser can re-render the
+        page mid-loop and wipe out in-flight ``setTimeout`` promises, causing all
+        clicks to fire in rapid succession and triggering rate limits.  Python
+        ``asyncio`` sleeps are unaffected by browser re-renders.
+
+        Each iteration re-queries by ``aria-label`` text so DOM reordering after
+        a click (e.g. LinkedIn moving the viewed thread to the top of the list)
+        does not cause index drift.
         """
+        # Step 1: collect names only — no clicks, no DOM references retained.
         # The Ember click handler lives on an inner div; the <li> and <label>
         # don't trigger SPA navigation.  No role/aria attributes exist on the
         # clickable element, so class-name selectors are unavoidable here.
         # Participant names are extracted from the <label aria-label> instead
         # of innerText to avoid layout-dependent parsing.
-        conversations: list[dict[str, str]] = await self._page.evaluate(
-            """async ({ limit }) => {
+        names: list[str] = await self._page.evaluate(
+            """({ limit }) => {
                 const labels = Array.from(document.querySelectorAll(
                     'main label[aria-label^="Select conversation"]'
                 ));
-                const results = [];
-                for (let i = 0; i < Math.min(labels.length, limit); i++) {
-                    const label = labels[i];
+                return labels.slice(0, limit).map(label => {
                     const ariaLabel = label.getAttribute('aria-label') || '';
-                    const name = ariaLabel
+                    return ariaLabel
                         .replace(/^Select conversation with\\s*/i, '').trim();
-                    const clickTarget = label.closest('li')
-                        ?.querySelector('div[class*="listitem__link"]');
-                    if (!clickTarget) continue;
-                    clickTarget.click();
-                    await new Promise(r => setTimeout(r, 300));
-                    const match = location.href.match(
-                        /\\/messaging\\/thread\\/([^/?#]+)/
-                    );
-                    if (match) {
-                        results.push({ name, threadId: match[1] });
-                    }
-                }
-                return results;
+                });
             }""",
             {"limit": limit},
         )
+
+        # Step 2: click each conversation in Python, pausing between clicks.
         refs: list[Reference] = []
-        for conv in conversations:
+        for name in names:
+            # Re-query each iteration so DOM reordering doesn't cause drift.
+            aria_label = f"Select conversation with {name}" if name else None
+            selector = (
+                f'main label[aria-label="{aria_label}"]'
+                if aria_label
+                else 'main label[aria-label^="Select conversation"]'
+            )
+            label_locator = self._page.locator(selector).first
+            li_locator = label_locator.locator(
+                'xpath=ancestor::li//div[contains(@class,"listitem__link")]'
+            ).first
+            try:
+                # Use JS .click() to match what the original code did — Ember's
+                # event delegation can miss synthetic Playwright mouse events.
+                await li_locator.evaluate("el => el.click()")
+            except Exception:
+                logger.debug("inbox click failed for %r, skipping", name)
+                continue
+            await _EXTRACTOR_PACER.after_click(reason="inbox conversation click")
+            match = re.search(
+                r"/messaging/thread/([^/?#]+)", self._page.url
+            )
+            if not match:
+                continue
             ref: Reference = {
                 "kind": "conversation",
-                "url": f"/messaging/thread/{conv['threadId']}/",
+                "url": f"/messaging/thread/{match.group(1)}/",
                 "context": "inbox",
             }
-            if conv.get("name"):
-                ref["text"] = conv["name"]
+            if name:
+                ref["text"] = name
             refs.append(ref)
         return refs
 
@@ -2219,9 +2541,7 @@ class LinkedInExtractor:
         await detect_rate_limit(self._page)
         await self._wait_for_main_text(log_context="Conversation")
         await handle_modal_close(self._page)
-        await self._scroll_main_scrollable_region(
-            position="top", attempts=3, pause_time=0.5
-        )
+        await self._scroll_main_scrollable_region(position="top", attempts=3)
 
         raw_result = await self._extract_root_content(["main"])
         raw = raw_result["text"]
@@ -2248,10 +2568,11 @@ class LinkedInExtractor:
             search_input = self._page.get_by_role("searchbox")
             await search_input.wait_for()
             await search_input.click()
+            await _EXTRACTOR_PACER.after_click(reason="conversation searchbox click")
             await self._page.keyboard.type(keywords, delay=30)
-            await asyncio.sleep(1.0)
+            await _EXTRACTOR_PACER.after_click(reason="conversation search query typed")
             await self._page.keyboard.press("Enter")
-            await asyncio.sleep(1.5)
+            await _EXTRACTOR_PACER.after_click(reason="conversation search enter press")
         except PlaywrightTimeoutError:
             logger.warning("Messaging search input not found")
 
@@ -2279,6 +2600,7 @@ class LinkedInExtractor:
         *,
         confirm_send: bool,
         profile_urn: str | None = None,
+        recipient_name: str | None = None,
     ) -> dict[str, Any]:
         """Send a message to a LinkedIn user with explicit confirmation gating.
 
@@ -2288,39 +2610,82 @@ class LinkedInExtractor:
             confirm_send: Must be True to actually send (False does a dry run).
             profile_urn: Optional profile URN (e.g. ACoAAB...) to construct the
                 compose URL directly, bypassing the Message-button lookup.
+            recipient_name: Optional display name (first name is usually enough) to
+                open the compose page and type into the recipient picker directly,
+                skipping profile page navigation entirely.
         """
         profile_url = f"https://www.linkedin.com/in/{linkedin_username}/"
-        await self._navigate_to_page(profile_url)
-        await detect_rate_limit(self._page)
+        display_name: str | None = None
 
-        try:
-            await self._page.wait_for_selector("main")
-        except PlaywrightTimeoutError:
-            logger.debug("Profile page did not load for %s", linkedin_username)
-
-        await handle_modal_close(self._page)
-        display_name = await self._read_profile_display_name()
         if profile_urn:
-            compose_url: str | None = (
+            # Fastest path: go straight to the compose URL with pre-filled
+            # recipient — no profile page visit needed at all.
+            compose_url = (
                 f"https://www.linkedin.com/messaging/compose/?recipient={profile_urn}"
             )
-        else:
-            compose_url = await self._resolve_message_compose_href()
-        if not compose_url:
-            return self._message_action_result(
-                profile_url,
-                "message_unavailable",
-                "LinkedIn did not expose a usable Message action for this profile.",
+            display_name = recipient_name  # may be None; username used as fallback
+            logger.info(
+                "send_message: using profile_urn direct compose for %s",
+                linkedin_username,
             )
+            await self._navigate_to_page(compose_url)
+        elif recipient_name:
+            # Fast path: open blank compose page + type name in recipient
+            # picker.  Fewer steps than inbox search or profile navigation.
+            compose_url = "https://www.linkedin.com/messaging/compose/"
+            display_name = recipient_name
+            logger.info(
+                "send_message: using compose-direct for %s with name %r",
+                linkedin_username,
+                recipient_name,
+            )
+            await self._navigate_to_page(compose_url)
+        else:
+            # Slowest path: visit the profile page to discover the compose
+            # URL (needs the Message button / compose link on the profile).
+            await self._navigate_to_page(profile_url)
+            await detect_rate_limit(self._page)
 
-        await self._navigate_to_page(compose_url)
+            try:
+                await self._page.wait_for_selector("main")
+            except PlaywrightTimeoutError:
+                logger.debug("Profile page did not load for %s", linkedin_username)
+
+            await handle_modal_close(self._page)
+            display_name = await self._read_profile_display_name()
+            compose_url = await self._resolve_message_compose_href()
+            if not compose_url:
+                return self._message_action_result(
+                    profile_url,
+                    "message_unavailable",
+                    "LinkedIn did not expose a usable Message action for this profile.",
+                )
+
+            await self._navigate_to_page(compose_url)
+
         await detect_rate_limit(self._page)
 
-        try:
-            await self._page.wait_for_selector("main")
-        except PlaywrightTimeoutError:
-            logger.debug("Compose page did not fully load for %s", linkedin_username)
+        # LinkedIn's SPA may rewrite our clean compose URL to include
+        # interop=msgOverlay.  When detected, strip it and re-navigate.
+        if "interop=msgOverlay" in (self._page.url or ""):
+            logger.debug(
+                "Overlay URL detected (%s), forcing clean compose reload",
+                self._page.url,
+            )
+            overlay_qs = parse_qs(urlparse(self._page.url).query)
+            overlay_recipient = overlay_qs.get("recipient", [None])[0]
+            if overlay_recipient:
+                clean_compose = f"https://www.linkedin.com/messaging/compose/?recipient={overlay_recipient}"
+            else:
+                clean_compose = "https://www.linkedin.com/messaging/compose/"
+            await self._page.goto(clean_compose, wait_until="domcontentloaded", timeout=30000)
+            await stabilize_navigation(f"overlay-escape {clean_compose}", logger)
 
+        # Skip networkidle — LinkedIn keeps persistent WebSocket connections
+        # that prevent the network from ever settling.  Instead, just give
+        # the SPA a moment then let the JS retry loop in
+        # _resolve_message_compose_box handle hydration timing.
+        await asyncio.sleep(2)
         await handle_modal_close(self._page)
         message_surface = await self._wait_for_message_surface()
         logger.debug(
@@ -2396,44 +2761,37 @@ class LinkedInExtractor:
             )
 
         await compose_box.click()
-        await compose_box.press_sequentially(message, delay=30)
-        await asyncio.sleep(0.3)
+        await _EXTRACTOR_PACER.after_click(reason="message compose box click")
+        await compose_box.type(message, delay=30)
+        await _EXTRACTOR_PACER.after_click(reason="message text typed")
 
-        try:
-            await self._page.wait_for_function(
+        # Find and click the Send button via JS — single pass, no locator.
+        send_clicked = False
+        for _attempt in range(6):  # up to ~15 s
+            send_clicked = await self._page.evaluate(
                 """() => {
-                    const isVisible = element =>
-                        !!(
-                            element &&
-                            (element.offsetWidth ||
-                                element.offsetHeight ||
-                                element.getClientRects().length)
-                        );
-                    return Array.from(
+                    const isVisible = el =>
+                        !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+                    const btn = Array.from(
                         document.querySelectorAll(
                             'button[type="submit"], button[aria-label*="Send"], button[aria-label*="send"]'
                         )
-                    ).some(button => isVisible(button) && !button.disabled);
-                }""",
+                    ).find(b => isVisible(b) && !b.disabled);
+                    if (btn) { btn.click(); return true; }
+                    return false;
+                }"""
             )
-        except PlaywrightTimeoutError:
+            if send_clicked:
+                await _EXTRACTOR_PACER.after_click(reason="message send button click")
+                break
+            await asyncio.sleep(3)
+
+        if not send_clicked:
             await self._dismiss_message_ui()
             return self._message_action_result(
                 self._page.url,
                 "send_unavailable",
                 "LinkedIn did not expose an enabled Send action for this draft.",
-                recipient_selected=recipient_selected,
-            )
-
-        send_button = self._page.locator(_MESSAGING_ENABLED_SEND_SELECTOR).last
-        try:
-            await send_button.click()
-        except PlaywrightTimeoutError:
-            await self._dismiss_message_ui()
-            return self._message_action_result(
-                self._page.url,
-                "send_unavailable",
-                "LinkedIn did not confirm that the message was sent.",
                 recipient_selected=recipient_selected,
             )
 

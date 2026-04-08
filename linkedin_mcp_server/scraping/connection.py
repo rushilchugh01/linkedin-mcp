@@ -67,3 +67,21 @@ def detect_connection_state(profile_text: str) -> ConnectionState:
     if "\nFollow\n" in action_area or action_area.endswith("\nFollow"):
         return "follow_only"
     return "unavailable"
+
+
+def detect_connection_metadata(profile_text: str) -> dict[str, object]:
+    """Return structured connection metadata from scraped profile text."""
+    status = detect_connection_state(profile_text)
+    degree_match = re.search(
+        r"(?:^|\n)\s*·\s*(1st|2nd|3rd\+?)\b",
+        profile_text[:500],
+        re.IGNORECASE,
+    )
+    degree = degree_match.group(1) if degree_match else ""
+    return {
+        "status": status,
+        "degree": degree,
+        "is_connected": status == "already_connected",
+        "is_pending": status == "pending",
+        "is_connectable": status in {"connectable", "incoming_request"},
+    }

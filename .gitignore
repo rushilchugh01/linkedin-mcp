@@ -130,6 +130,8 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.venv-win/
+.linkedin-live-profile-win/
 env/
 venv/
 ENV/
@@ -208,3 +210,15 @@ scripts/snapshot_dumps/
 
 # Debug artifacts
 .debug/
+
+# Local LinkedIn smoke-test captures and exports (may contain private data)
+.tmp/
+data/
+*.jsonl
+connections.html
+connections_output.json
+parse_connections.py
+test_parse_linkedin.py
+browser-install.json
+source-state.json
+patchright-browsers/

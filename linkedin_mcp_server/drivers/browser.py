@@ -46,7 +46,7 @@ DEFAULT_PROFILE_DIR = Path.home() / ".linkedin-mcp" / "profile"
 # Global browser instance (singleton)
 _browser: BrowserManager | None = None
 _browser_cookie_export_path: Path | None = None
-_headless: bool = True
+_headless: bool = False
 
 
 def _debug_skip_checkpoint_restart() -> bool:
@@ -206,8 +206,46 @@ def _make_browser(
         slow_mo=config.browser.slow_mo,
         user_agent=config.browser.user_agent,
         viewport=viewport,
+        cdp_endpoint=config.browser.cdp_endpoint,
         **launch_options,
     )
+
+
+def _browser_is_usable(browser: BrowserManager) -> bool:
+    """Return false when the cached browser points at a closed Patchright page."""
+    try:
+        page = browser.page
+    except Exception:
+        return False
+
+    is_closed = getattr(page, "is_closed", None)
+    if callable(is_closed):
+        try:
+            return not bool(is_closed())
+        except Exception:
+            return False
+
+    try:
+        _ = page.url
+        return True
+    except Exception:
+        return False
+
+
+async def _discard_cached_browser(reason: str) -> None:
+    global _browser, _browser_cookie_export_path
+
+    browser = _browser
+    _browser = None
+    _browser_cookie_export_path = None
+    if browser is None:
+        return
+
+    logger.warning("Discarding cached browser: %s", reason)
+    try:
+        await browser.close()
+    except Exception as exc:
+        logger.debug("Closing discarded browser failed: %s", exc)
 
 
 async def _authenticate_existing_profile(
@@ -366,10 +404,28 @@ async def get_or_create_browser(
         _headless = headless
 
     if _browser is not None:
-        return _browser
+        if _browser_is_usable(_browser):
+            return _browser
+        await _discard_cached_browser("cached page/context is closed")
 
     launch_options, viewport = _launch_options()
     source_profile_dir = get_profile_dir()
+
+    if get_config().browser.cdp_endpoint:
+        logger.info(
+            "Attaching to existing browser via CDP endpoint %s",
+            get_config().browser.cdp_endpoint,
+        )
+        browser = await _authenticate_existing_profile(
+            source_profile_dir,
+            launch_options=launch_options,
+            viewport=viewport,
+        )
+        _apply_browser_settings(browser)
+        _browser = browser
+        _browser_cookie_export_path = None
+        return _browser
+
     cookie_path = portable_cookie_path(source_profile_dir)
     source_state = load_source_state(source_profile_dir)
     if (
@@ -522,6 +578,16 @@ def set_headless(headless: bool) -> None:
     _headless = headless
 
 
+def get_headless() -> bool:
+    """Return the headless mode that will be used for future browser creation."""
+    return _headless
+
+
+def has_active_browser() -> bool:
+    """Return whether the shared browser singleton has already been created."""
+    return _browser is not None
+
+
 async def validate_session() -> bool:
     """
     Check whether startup authentication has already succeeded for this browser.
@@ -567,4 +633,4 @@ def reset_browser_for_testing() -> None:
     global _browser, _browser_cookie_export_path, _headless
     _browser = None
     _browser_cookie_export_path = None
-    _headless = True
+    _headless = False

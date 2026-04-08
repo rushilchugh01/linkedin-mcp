@@ -323,3 +323,55 @@ def test_clear_profile_and_exit_clears_all_auth_state(
     assert cleared["profile"] == profile_dir
     captured = capsys.readouterr()
     assert "authentication state cleared" in captured.out.lower()
+
+
+def test_run_direct_cli_command_and_exit_prints_json(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = AppConfig()
+    config.server.cli_command = "post-details"
+    config.server.cli_args = {"post_url": "urn:li:activity:1", "output": None}
+
+    monkeypatch.setattr(
+        "linkedin_mcp_server.cli_main.ensure_browser_installed", lambda: None
+    )
+    monkeypatch.setattr(
+        "linkedin_mcp_server.cli_main._run_direct_cli_command",
+        AsyncMock(return_value={"ok": True}),
+    )
+    monkeypatch.setattr("linkedin_mcp_server.cli_main.close_browser", AsyncMock())
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli_main.run_direct_cli_command_and_exit(config)
+
+    assert exit_info.value.code == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"ok": True}
+
+
+def test_main_runs_direct_cli_command_before_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _make_config(
+        is_interactive=False,
+        transport="stdio",
+        transport_explicitly_set=False,
+    )
+    config.server.cli_command = "company-engagement"
+    config.server.cli_args = {"company_name": "testcorp"}
+    _patch_main_dependencies(monkeypatch, config)
+    direct = MagicMock(side_effect=SystemExit(0))
+    create_server = MagicMock()
+    monkeypatch.setattr(
+        "linkedin_mcp_server.cli_main.run_direct_cli_command_and_exit",
+        direct,
+    )
+    monkeypatch.setattr("linkedin_mcp_server.cli_main.create_mcp_server", create_server)
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli_main.main()
+
+    assert exit_info.value.code == 0
+    direct.assert_called_once_with(config)
+    create_server.assert_not_called()

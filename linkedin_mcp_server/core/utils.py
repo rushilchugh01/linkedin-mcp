@@ -2,12 +2,52 @@
 
 import asyncio
 import logging
+import random
 
 from patchright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 
 from .exceptions import RateLimitError
 
 logger = logging.getLogger(__name__)
+
+
+async def _core_pace(reason: str) -> None:
+    """Short random delay after click actions (avoids circular import with scraping)."""
+    delay = random.uniform(5.0, 15.0)
+    logger.debug("core pace %.1fs: %s", delay, reason)
+    await asyncio.sleep(delay)
+
+SCROLL_PAUSE_MIN_SECONDS = 2.0
+SCROLL_PAUSE_MAX_SECONDS = 4.0
+
+
+def _scroll_pause_bounds(
+    pause_time: float | None,
+    min_pause_time: float,
+    max_pause_time: float,
+) -> tuple[float, float]:
+    minimum = max(SCROLL_PAUSE_MIN_SECONDS, float(min_pause_time))
+    maximum = max(SCROLL_PAUSE_MAX_SECONDS, float(max_pause_time), minimum)
+    if pause_time is not None:
+        logger.debug(
+            "Ignoring fixed scroll pause_time=%s; using randomized %.1f-%.1fs pause",
+            pause_time,
+            minimum,
+            maximum,
+        )
+    return minimum, maximum
+
+
+async def _sleep_after_scroll(
+    *,
+    min_pause_time: float = SCROLL_PAUSE_MIN_SECONDS,
+    max_pause_time: float = SCROLL_PAUSE_MAX_SECONDS,
+    reason: str,
+) -> float:
+    delay = random.uniform(min_pause_time, max_pause_time)
+    logger.debug("%s: randomized post-scroll pause %.2fs", reason, delay)
+    await asyncio.sleep(delay)
+    return delay
 
 
 async def detect_rate_limit(page: Page) -> None:
@@ -66,19 +106,32 @@ async def detect_rate_limit(page: Page) -> None:
 
 
 async def scroll_to_bottom(
-    page: Page, pause_time: float = 1.0, max_scrolls: int = 10
+    page: Page,
+    pause_time: float | None = None,
+    max_scrolls: int = 10,
+    min_pause_time: float = SCROLL_PAUSE_MIN_SECONDS,
+    max_pause_time: float = SCROLL_PAUSE_MAX_SECONDS,
 ) -> None:
     """Scroll to the bottom of the page to trigger lazy loading.
 
     Args:
         page: Patchright page object
-        pause_time: Time to pause between scrolls (seconds)
+        pause_time: Deprecated fixed pause; ignored in favor of 2-4s randomized pauses
         max_scrolls: Maximum number of scroll attempts
+        min_pause_time: Minimum randomized post-scroll pause in seconds
+        max_pause_time: Maximum randomized post-scroll pause in seconds
     """
+    min_pause_time, max_pause_time = _scroll_pause_bounds(
+        pause_time, min_pause_time, max_pause_time
+    )
     for i in range(max_scrolls):
         previous_height = await page.evaluate("document.body.scrollHeight")
         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await asyncio.sleep(pause_time)
+        await _sleep_after_scroll(
+            min_pause_time=min_pause_time,
+            max_pause_time=max_pause_time,
+            reason=f"page scroll {i + 1}/{max_scrolls}",
+        )
 
         new_height = await page.evaluate("document.body.scrollHeight")
         if new_height == previous_height:
@@ -87,7 +140,11 @@ async def scroll_to_bottom(
 
 
 async def scroll_job_sidebar(
-    page: Page, pause_time: float = 1.0, max_scrolls: int = 10
+    page: Page,
+    pause_time: float | None = None,
+    max_scrolls: int = 10,
+    min_pause_time: float = SCROLL_PAUSE_MIN_SECONDS,
+    max_pause_time: float = SCROLL_PAUSE_MAX_SECONDS,
 ) -> None:
     """Scroll the job search sidebar to load all job cards.
 
@@ -98,9 +155,14 @@ async def scroll_job_sidebar(
 
     Args:
         page: Patchright page object
-        pause_time: Time to pause between scrolls (seconds)
+        pause_time: Deprecated fixed pause; ignored in favor of 2-4s randomized pauses
         max_scrolls: Maximum number of scroll attempts
+        min_pause_time: Minimum randomized post-scroll pause in seconds
+        max_pause_time: Maximum randomized post-scroll pause in seconds
     """
+    min_pause_time, max_pause_time = _scroll_pause_bounds(
+        pause_time, min_pause_time, max_pause_time
+    )
     # Wait for at least one job card link to render before scrolling
     try:
         await page.wait_for_selector('a[href*="/jobs/view/"]', timeout=5000)
@@ -132,13 +194,18 @@ async def scroll_job_sidebar(
             for (let i = 0; i < maxScrolls; i++) {
                 const prevHeight = container.scrollHeight;
                 container.scrollTop = container.scrollHeight;
-                await new Promise(r => setTimeout(r, pauseTime * 1000));
+                const pauseSeconds = pauseMin + Math.random() * (pauseMax - pauseMin);
+                await new Promise(r => setTimeout(r, pauseSeconds * 1000));
                 if (container.scrollHeight === prevHeight) break;
                 scrollCount++;
             }
             return scrollCount;
         }""",
-        {"pauseTime": pause_time, "maxScrolls": max_scrolls},
+        {
+            "pauseMin": min_pause_time,
+            "pauseMax": max_pause_time,
+            "maxScrolls": max_scrolls,
+        },
     )
     if scrolled == -2:
         logger.debug("Job card link disappeared before evaluate, skipping scroll")
@@ -165,7 +232,7 @@ async def handle_modal_close(page: Page) -> bool:
 
         if await close_button.is_visible(timeout=1000):
             await close_button.click()
-            await asyncio.sleep(0.5)
+            await _core_pace(reason="modal close click")
             logger.debug("Closed modal")
             return True
     except PlaywrightTimeoutError:

@@ -1,5 +1,6 @@
 """Tests for the LinkedInExtractor scraping engine."""
 
+from datetime import date
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -17,6 +18,7 @@ from linkedin_mcp_server.scraping.extractor import (
     ExtractedSection,
     LinkedInExtractor,
     _RATE_LIMITED_MSG,
+    _filter_recent_activity_to_past_year,
     _truncate_linkedin_noise,
     strip_linkedin_noise,
 )
@@ -577,7 +579,7 @@ class TestScrapePersonUrls:
                 extractor,
                 "extract_page",
                 new_callable=AsyncMock,
-                return_value=extracted("profile text"),
+                return_value=extracted("Jane Doe\n\n· 1st\n\nGeneral Counsel\n\nMessage\nMore"),
             ) as mock_extract,
             patch.object(
                 extractor,
@@ -596,6 +598,13 @@ class TestScrapePersonUrls:
         assert len(urls) == 1
         assert urls[0].endswith("/in/testuser/")
         assert set(result["sections"]) == {"main_profile"}
+        assert result["connection"] == {
+            "status": "already_connected",
+            "degree": "1st",
+            "is_connected": True,
+            "is_pending": False,
+            "is_connectable": False,
+        }
 
     async def test_scrape_person_returns_section_errors(self, mock_page):
         extractor = LinkedInExtractor(mock_page)
@@ -729,6 +738,53 @@ class TestScrapePersonUrls:
         assert any("/recent-activity/all/" in url for url in urls)
         assert "posts" in result["sections"]
 
+    async def test_posts_section_stops_at_activity_older_than_one_year(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        text = (
+            "Recent post\n"
+            "11mo\n"
+            "Legal AI update\n\n"
+            "Old post\n"
+            "1yr\n"
+            "Older activity\n\n"
+            "Very old post\n"
+            "2yr\n"
+            "Should not be retained"
+        )
+        with (
+            patch.object(
+                extractor,
+                "extract_page",
+                new_callable=AsyncMock,
+                return_value=extracted(text),
+            ),
+            patch.object(
+                extractor,
+                "_extract_overlay",
+                new_callable=AsyncMock,
+                return_value=extracted(""),
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await extractor.scrape_person("test-user", {"posts"})
+
+        assert result["sections"]["posts"] == (
+            "Recent post\n11mo\nLegal AI update"
+        )
+
+    def test_recent_activity_filter_handles_absolute_dates(self):
+        text = (
+            "Recent post\nMar 1, 2026\nStill current\n\n"
+            "Old post\nMar 1, 2025\nToo old"
+        )
+
+        assert _filter_recent_activity_to_past_year(
+            text, today=date(2026, 4, 8)
+        ) == "Recent post\nMar 1, 2026\nStill current"
+
     async def test_certifications_visits_details_page(self, mock_page):
         extractor = LinkedInExtractor(mock_page)
         with (
@@ -803,6 +859,32 @@ class TestDetectConnectionState:
         area = _extract_action_area(text)
         assert "Follow" not in area
         assert "Pending" in area
+
+    def test_connection_metadata_marks_existing_connection(self):
+        from linkedin_mcp_server.scraping.connection import detect_connection_metadata
+
+        text = "Jane Doe\n\n· 1st\n\nGeneral Counsel\n\nMessage\nMore"
+
+        assert detect_connection_metadata(text) == {
+            "status": "already_connected",
+            "degree": "1st",
+            "is_connected": True,
+            "is_pending": False,
+            "is_connectable": False,
+        }
+
+    def test_connection_metadata_marks_connectable_profile(self):
+        from linkedin_mcp_server.scraping.connection import detect_connection_metadata
+
+        text = "Jane Doe\n\n· 2nd\n\nGeneral Counsel\n\nConnect\nMore"
+
+        assert detect_connection_metadata(text) == {
+            "status": "connectable",
+            "degree": "2nd",
+            "is_connected": False,
+            "is_pending": False,
+            "is_connectable": True,
+        }
 
 
 class TestConnectWithPerson:
@@ -1780,10 +1862,10 @@ class TestStripLinkedInNoise:
 class TestActivityFeedExtraction:
     """Tests for activity page detection and wait behavior in _extract_page_once."""
 
-    async def test_activity_page_waits_for_content_and_uses_slow_scroll(
+    async def test_activity_page_waits_for_content_and_uses_bounded_scroll(
         self, mock_page
     ):
-        """Activity URLs should call wait_for_function and use slower scroll params."""
+        """Activity URLs should call wait_for_function and use bounded scroll params."""
         mock_page.evaluate = AsyncMock(
             return_value={
                 "source": "root",
@@ -1816,12 +1898,14 @@ class TestActivityFeedExtraction:
         mock_page.wait_for_function.assert_awaited_once()
         mock_scroll.assert_awaited_once()
         _, kwargs = mock_scroll.call_args
-        assert kwargs["pause_time"] == 1.0
+        assert "pause_time" not in kwargs
         assert kwargs["max_scrolls"] == 10
         assert len(result.text) > 200
 
-    async def test_non_activity_page_skips_wait_and_uses_fast_scroll(self, mock_page):
-        """Non-activity URLs should not call wait_for_function and use fast scroll."""
+    async def test_non_activity_page_skips_wait_and_uses_bounded_scroll(
+        self, mock_page
+    ):
+        """Non-activity URLs should not call wait_for_function and use bounded scroll."""
         mock_page.evaluate = AsyncMock(
             return_value={"source": "root", "text": "Profile text", "references": []}
         )
@@ -1850,7 +1934,7 @@ class TestActivityFeedExtraction:
         mock_page.wait_for_function.assert_not_awaited()
         mock_scroll.assert_awaited_once()
         _, kwargs = mock_scroll.call_args
-        assert kwargs["pause_time"] == 0.5
+        assert "pause_time" not in kwargs
         assert kwargs["max_scrolls"] == 5
 
     async def test_activity_page_timeout_proceeds_gracefully(self, mock_page):

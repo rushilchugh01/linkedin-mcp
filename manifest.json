@@ -3,17 +3,17 @@
   "name": "linkedin-mcp-server",
   "display_name": "LinkedIn MCP Server",
   "version": "4.8.2",
-  "description": "Connect Claude to LinkedIn for profiles, connection requests, companies, job details, and people search",
+  "description": "Connect Claude to LinkedIn for profiles, connection requests, companies, post engagement, job details, and people search",
   "long_description": "# LinkedIn MCP Server\n\nConnect Claude to your LinkedIn account with an MCP Bundle (MCPB, formerly DXT). The bundle starts quickly, downloads the Patchright Chromium browser in the background when needed, and opens LinkedIn login on the first auth-requiring tool call.\n\n## First-time managed runtime flow\n\n1. Install the `.mcpb` bundle in Claude Desktop.\n2. Start Claude Desktop; the MCP server starts and begins preparing the Patchright Chromium browser cache under `~/.linkedin-mcp/patchright-browsers`.\n3. If you call a tool before setup finishes, the tool returns a setup-in-progress error.\n4. On the first tool call that needs authentication, a browser window opens so you can sign into LinkedIn.\n5. Retry the tool after login completes.\n\nDocker remains available as a separate runtime path, but it still requires host-side `--login`.",
   "author": {
     "name": "Daniel Sticker",
     "email": "daniel@sticker.name",
     "url": "https://daniel.sticker.name/"
   },
-  "homepage": "https://github.com/stickerdaniel/linkedin-mcp-server",
-  "documentation": "https://github.com/stickerdaniel/linkedin-mcp-server#readme",
-  "support": "https://github.com/stickerdaniel/linkedin-mcp-server/issues",
-  "license": "MIT",
+  "homepage": "https://github.com/rushilchugh01/linkedin-mcp",
+  "documentation": "https://github.com/rushilchugh01/linkedin-mcp#readme",
+  "support": "https://github.com/rushilchugh01/linkedin-mcp/issues",
+  "license": "Apache-2.0",
   "keywords": [
     "linkedin",
     "scraping",
@@ -64,6 +64,22 @@
     {
       "name": "get_company_posts",
       "description": "Get recent posts from a company's LinkedIn feed"
+    },
+    {
+      "name": "get_post_details",
+      "description": "Get normalized details and engagement counts for one LinkedIn feed post URL"
+    },
+    {
+      "name": "get_post_comments",
+      "description": "Get visible comments and commenter profile references for one LinkedIn feed post URL"
+    },
+    {
+      "name": "get_post_reactors",
+      "description": "Get visible reactors or likers and reaction types for one LinkedIn feed post URL"
+    },
+    {
+      "name": "company_engagement",
+      "description": "Collect bounded recent company post engagement with optional comments and reactors"
     },
     {
       "name": "get_job_details",

@@ -1,9 +1,11 @@
 """LinkedIn MCP Server main CLI application entry point."""
 
 import asyncio
+import json
 import logging
+from pathlib import Path
 import sys
-from typing import Literal
+from typing import Any, Literal
 
 import inquirer
 
@@ -14,6 +16,7 @@ from linkedin_mcp_server.bootstrap import (
 from linkedin_mcp_server.core import AuthenticationError
 from linkedin_mcp_server.authentication import clear_auth_state
 from linkedin_mcp_server.config import get_config
+from linkedin_mcp_server.config.schema import AppConfig
 from linkedin_mcp_server.drivers.browser import (
     experimental_persist_derived_runtime,
     close_browser,
@@ -24,6 +27,12 @@ from linkedin_mcp_server.drivers.browser import (
 )
 from linkedin_mcp_server.debug_trace import should_keep_traces
 from linkedin_mcp_server.logging_config import configure_logging, teardown_trace_logging
+from linkedin_mcp_server.local_crm import record_tool_result
+from linkedin_mcp_server.scraping.post import (
+    scrape_post_comments,
+    scrape_post_details,
+    scrape_post_reactors,
+)
 from linkedin_mcp_server.session_state import (
     get_runtime_id,
     load_runtime_state,
@@ -35,6 +44,11 @@ from linkedin_mcp_server.session_state import (
 )
 from linkedin_mcp_server.server import create_mcp_server
 from linkedin_mcp_server.setup import run_profile_creation
+from linkedin_mcp_server.workflows.company_engagement import collect_company_engagement
+from linkedin_mcp_server.workflows.feed_engagement import (
+    collect_feed_engagement,
+    search_feed_posts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -231,6 +245,112 @@ def profile_info_and_exit() -> None:
     sys.exit(1)
 
 
+def _write_cli_json_result(result: dict[str, Any], output: str | None) -> None:
+    """Write a direct CLI command result as JSON."""
+    payload = json.dumps(result, indent=2, sort_keys=True) + "\n"
+    if output:
+        output_path = Path(output).expanduser()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(payload, encoding="utf-8")
+        logger.info("Direct CLI result written to %s", output_path)
+        return
+    print(payload, end="")
+
+
+async def _run_direct_cli_command(config: AppConfig) -> dict[str, Any]:
+    """Run a direct scraping CLI command without starting the MCP server."""
+    command = config.server.cli_command
+    args = config.server.cli_args
+    logger.info("Direct CLI command started: command=%s args=%s", command, args)
+
+    from linkedin_mcp_server.dependencies import get_ready_extractor
+
+    extractor = await get_ready_extractor(None, tool_name=command or "direct_cli")
+    if command == "post-details":
+        return await scrape_post_details(extractor, args["post_url"])
+    if command == "post-comments":
+        return await scrape_post_comments(
+            extractor,
+            args["post_url"],
+            limit=args.get("limit"),
+        )
+    if command == "post-reactors":
+        return await scrape_post_reactors(
+            extractor,
+            args["post_url"],
+            limit=args.get("limit"),
+            reaction_type=args.get("reaction_type"),
+        )
+    if command == "company-engagement":
+        return await collect_company_engagement(
+            extractor,
+            args["company_name"],
+            limit=args.get("limit"),
+            include_comments=args.get("include_comments", True),
+            include_reactors=args.get("include_reactors", False),
+            comment_limit=args.get("comment_limit"),
+            reactor_limit=args.get("reactor_limit"),
+            reaction_type=args.get("reaction_type"),
+        )
+    if command == "search-feed-posts":
+        return await search_feed_posts(
+            extractor,
+            keywords=args.get("keywords"),
+            max_posts=args.get("max_posts"),
+            scrolls=args.get("scrolls"),
+            min_reactions=args.get("min_reactions", 0),
+            min_comments=args.get("min_comments", 0),
+            include_promoted=args.get("include_promoted", False),
+        )
+    if command == "feed-engagement":
+        return await collect_feed_engagement(
+            extractor,
+            keywords=args.get("keywords"),
+            max_posts=args.get("max_posts"),
+            scrolls=args.get("scrolls"),
+            include_comments=args.get("include_comments", True),
+            include_reactors=args.get("include_reactors", False),
+            comment_limit=args.get("comment_limit"),
+            reactor_limit=args.get("reactor_limit"),
+            reaction_type=args.get("reaction_type"),
+            min_reactions=args.get("min_reactions", 0),
+            min_comments=args.get("min_comments", 0),
+            include_promoted=args.get("include_promoted", False),
+        )
+    raise ValueError(f"Unknown direct CLI command: {command}")
+
+
+def run_direct_cli_command_and_exit(config: AppConfig) -> None:
+    """Run a configured direct CLI command and exit."""
+    try:
+        ensure_browser_installed()
+        result = asyncio.run(_run_direct_cli_command(config))
+        logger.info(
+            "Direct CLI command completed: command=%s",
+            config.server.cli_command,
+        )
+        record_tool_result(
+            config.server.cli_command or "direct_cli",
+            config.server.cli_args,
+            result,
+        )
+        _write_cli_json_result(result, config.server.cli_args.get("output"))
+        sys.exit(0)
+    except Exception as e:
+        logger.exception(
+            "Direct CLI command failed: command=%s error=%s",
+            config.server.cli_command,
+            e,
+        )
+        print(f"❌ Direct CLI command failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        try:
+            asyncio.run(close_browser())
+        except Exception:
+            logger.debug("Direct CLI browser cleanup failed", exc_info=True)
+
+
 def get_version() -> str:
     """Get version from installed metadata with a source fallback."""
     try:
@@ -299,6 +419,9 @@ def main() -> None:
         # Handle --status flag
         if config.server.status:
             profile_info_and_exit()
+
+        if config.server.cli_command:
+            run_direct_cli_command_and_exit(config)
 
         logger.debug(f"Server configuration: {config}")
 

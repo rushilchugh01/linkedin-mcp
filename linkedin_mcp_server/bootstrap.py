@@ -17,6 +17,7 @@ from fastmcp import Context
 
 from linkedin_mcp_server.authentication import get_authentication_source
 from linkedin_mcp_server.common_utils import secure_mkdir, secure_write_text, utcnow_iso
+from linkedin_mcp_server.config import get_config
 from linkedin_mcp_server.drivers.browser import get_profile_dir
 from linkedin_mcp_server.exceptions import (
     AuthenticationBootstrapFailedError,
@@ -152,6 +153,9 @@ async def start_background_browser_setup_if_needed() -> None:
 
 
 def browser_setup_ready() -> bool:
+    if get_config().browser.chrome_path:
+        return True
+
     metadata_path = install_metadata_path()
     configured_browsers_path = Path(
         os.environ.get("PLAYWRIGHT_BROWSERS_PATH", str(browsers_path()))
