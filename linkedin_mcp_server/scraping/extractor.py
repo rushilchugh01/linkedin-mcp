@@ -1836,31 +1836,24 @@ class LinkedInExtractor:
 
     async def _resolve_message_compose_box(self) -> Any | None:
         """Resolve the visible compose box used for writing a LinkedIn message."""
-        _COMPOSE_SELECTOR = (
-            '.msg-form__contenteditable[contenteditable="true"], '
-            'div[role="textbox"][contenteditable="true"][aria-label*="Write a message"]'
-        )
-        try:
-            await self._page.wait_for_selector(
-                _COMPOSE_SELECTOR, state="attached", timeout=30000
-            )
-        except PlaywrightTimeoutError:
-            logger.info("Compose textbox never appeared in DOM (30s)")
-            return None
-
-        handle = await self._page.evaluate_handle(
-            """() => {
-                const el =
-                    document.querySelector('.msg-form__contenteditable[contenteditable="true"]') ||
-                    document.querySelector('div[role="textbox"][contenteditable="true"][aria-label*="Write a message"]') ||
-                    document.querySelector('div[role="textbox"][contenteditable="true"]');
-                return el || null;
-            }"""
-        )
-        element = handle.as_element()
-        if element is None:
-            logger.info("Compose textbox in DOM but JS handle returned null")
-        return element
+        deadline = asyncio.get_running_loop().time() + 30
+        while asyncio.get_running_loop().time() < deadline:
+            for selector in _MESSAGING_COMPOSE_FALLBACK_SELECTORS:
+                candidates = self._page.locator(selector)
+                try:
+                    count = await candidates.count()
+                except Exception:
+                    continue
+                for index in range(count):
+                    candidate = candidates.nth(index)
+                    try:
+                        if await candidate.is_visible():
+                            return candidate
+                    except Exception:
+                        continue
+            await asyncio.sleep(0.5)
+        logger.info("Compose textbox never became visible (30s)")
+        return None
 
     async def _compose_page_matches_recipient(self, *candidates: str) -> bool:
         """Verify the compose page visibly identifies the intended recipient."""
@@ -1906,7 +1899,7 @@ class LinkedInExtractor:
         )
         return bool(matched)
 
-    async def _message_text_visible(self, message: str) -> bool:
+    async def _message_text_visible(self, message: str, *, timeout: int = 15000) -> bool:
         """Wait until the compose page visibly contains the just-sent message text.
 
         Uses the page-level default timeout (``BrowserConfig.default_timeout``).
@@ -1920,10 +1913,97 @@ class LinkedInExtractor:
                     return bodyText.includes(normalize(expected));
                 }""",
                 arg={"expected": message},
+                timeout=timeout,
             )
             return True
         except PlaywrightTimeoutError:
             return False
+
+    async def _message_draft_visible(self, message: str, *, timeout: int = 10000) -> bool:
+        """Wait until the compose box visibly contains the draft text."""
+        try:
+            await self._page.wait_for_function(
+                """({ expected, selectors }) => {
+                    const normalize = value =>
+                        (value || '').replace(/\\s+/g, ' ').trim();
+                    const target = normalize(expected);
+                    if (!target) return false;
+                    return selectors.some(selector =>
+                        Array.from(document.querySelectorAll(selector)).some(element => {
+                            if (!element) return false;
+                            const text = normalize(
+                                element.innerText ||
+                                element.textContent ||
+                                element.getAttribute('value') ||
+                                ''
+                            );
+                            return text.includes(target);
+                        })
+                    );
+                }""",
+                arg={
+                    "expected": message,
+                    "selectors": list(_MESSAGING_COMPOSE_FALLBACK_SELECTORS),
+                },
+                timeout=timeout,
+            )
+            return True
+        except PlaywrightTimeoutError:
+            return False
+
+    async def _populate_message_compose_box(
+        self,
+        message: str,
+        *,
+        attempts: int = 2,
+    ) -> bool:
+        """Populate the live LinkedIn composer with a full draft message."""
+        for attempt in range(1, attempts + 1):
+            compose_box = await self._resolve_message_compose_box()
+            if compose_box is None:
+                continue
+
+            try:
+                await compose_box.click(timeout=30000)
+                await _EXTRACTOR_PACER.after_click(reason="message compose box click")
+                await compose_box.fill(message, timeout=30000)
+            except Exception as error:
+                logger.info(
+                    "Message draft fill attempt %s/%s failed: %s",
+                    attempt,
+                    attempts,
+                    error,
+                )
+                try:
+                    await compose_box.click(timeout=30000)
+                    await _EXTRACTOR_PACER.after_click(
+                        reason="message compose box click retry"
+                    )
+                    await self._page.keyboard.press("Control+A")
+                    await self._page.keyboard.press("Backspace")
+                    await self._page.keyboard.insert_text(message)
+                except Exception as fallback_error:
+                    logger.info(
+                        "Message draft insert fallback %s/%s failed: %s",
+                        attempt,
+                        attempts,
+                        fallback_error,
+                    )
+                    await asyncio.sleep(1)
+                    continue
+
+            if await self._message_draft_visible(message):
+                await _EXTRACTOR_PACER.after_click(reason="message text inserted")
+                return True
+
+            logger.info(
+                "Message draft verification failed after attempt %s/%s",
+                attempt,
+                attempts,
+            )
+            await asyncio.sleep(1)
+
+        return False
 
     async def _dismiss_message_ui(self) -> None:
         """Best-effort dismissal for the profile messaging UI."""
@@ -2880,10 +2960,14 @@ class LinkedInExtractor:
                 recipient_selected=recipient_selected,
             )
 
-        await compose_box.click()
-        await _EXTRACTOR_PACER.after_click(reason="message compose box click")
-        await compose_box.type(message, delay=30)
-        await _EXTRACTOR_PACER.after_click(reason="message text typed")
+        if not await self._populate_message_compose_box(message):
+            await self._dismiss_message_ui()
+            return self._message_action_result(
+                self._page.url,
+                "send_unavailable",
+                "LinkedIn did not keep a stable message draft editor open long enough to populate the message.",
+                recipient_selected=recipient_selected,
+            )
 
         # Find and click the Send button via JS — single pass, no locator.
         send_clicked = False

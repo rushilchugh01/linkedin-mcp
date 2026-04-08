@@ -349,6 +349,14 @@ def register_post_tools(mcp: FastMCP) -> None:
                 total=100,
                 message="Starting feed engagement scrape",
             )
+
+            async def report(progress: int, total: int, message: str) -> None:
+                await ctx.report_progress(
+                    progress=progress,
+                    total=total,
+                    message=message,
+                )
+
             result = await collect_feed_engagement(
                 extractor,
                 keywords=keywords,
@@ -362,8 +370,8 @@ def register_post_tools(mcp: FastMCP) -> None:
                 min_reactions=min_reactions,
                 min_comments=min_comments,
                 include_promoted=include_promoted,
+                progress=report,
             )
-            await ctx.report_progress(progress=100, total=100, message="Complete")
             logger.info(
                 "Tool feed_engagement completed: posts=%d diagnostics=%d",
                 len(result.get("posts", [])),

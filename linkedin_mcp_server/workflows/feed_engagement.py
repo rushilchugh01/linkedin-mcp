@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from linkedin_mcp_server.core.utils import detect_rate_limit, handle_modal_close
 from linkedin_mcp_server.scraping.browser_pacing import BrowserPacer
@@ -81,6 +81,23 @@ def _diagnostic(stage: str, error: Exception, *, post_url: str | None = None) ->
     if post_url:
         diagnostic["post_url"] = post_url
     return diagnostic
+
+
+ProgressReporter = Callable[[int, int, str], Awaitable[None] | None]
+
+
+async def _report_progress(
+    reporter: ProgressReporter | None,
+    *,
+    progress: int,
+    total: int = 100,
+    message: str,
+) -> None:
+    if reporter is None:
+        return
+    outcome = reporter(progress, total, message)
+    if outcome is not None:
+        await outcome
 
 
 def _summarize_raw_feed_items(
@@ -467,6 +484,40 @@ async def _no_visible_feed_items_diagnostic(page: Any) -> dict[str, Any]:
     return diagnostic
 
 
+async def _prepare_feed_page(extractor: Any) -> None:
+    await _ensure_feed_page(extractor)
+    await detect_rate_limit(extractor._page)
+    try:
+        await extractor._page.wait_for_selector("main", timeout=5000)
+    except Exception:
+        logger.debug("No <main> element found on feed")
+    await handle_modal_close(extractor._page)
+    await _wait_for_feed_hydration(extractor._page)
+
+
+async def _preload_feed_posts(
+    extractor: Any,
+    *,
+    scrolls: int,
+    progress: ProgressReporter | None = None,
+) -> None:
+    if scrolls <= 0:
+        return
+
+    await _prepare_feed_page(extractor)
+    for index in range(scrolls):
+        progress_value = 5 + int(((index + 1) / max(1, scrolls)) * 35)
+        await _report_progress(
+            progress,
+            progress=progress_value,
+            message=f"Preloading feed scroll {index + 1}/{scrolls}",
+        )
+        await _FEED_PACER.scroll_page(
+            extractor._page,
+            reason=f"feed preload scroll {index + 1}/{scrolls}",
+        )
+
+
 async def search_feed_posts(
     extractor: Any,
     *,
@@ -510,14 +561,7 @@ async def search_feed_posts(
 
     summaries: list[dict[str, Any]] = []
     try:
-        await _ensure_feed_page(extractor)
-        await detect_rate_limit(extractor._page)
-        try:
-            await extractor._page.wait_for_selector("main", timeout=5000)
-        except Exception:
-            logger.debug("No <main> element found on feed")
-        await handle_modal_close(extractor._page)
-        await _wait_for_feed_hydration(extractor._page)
+        await _prepare_feed_page(extractor)
 
         for index in range(scroll_limit + 1):
             try:
@@ -591,10 +635,14 @@ async def collect_feed_engagement(
     min_comments: int = 0,
     include_promoted: bool = False,
     delay_range: tuple[float, float] = DEFAULT_DELAY_RANGE_SECONDS,
+    progress: ProgressReporter | None = None,
 ) -> dict[str, Any]:
     """Discover matching feed posts and enrich them with engagement data."""
     post_limit = _clamp_limit(
         max_posts, default=DEFAULT_ENGAGEMENT_POST_LIMIT, maximum=MAX_FEED_POST_LIMIT
+    )
+    scroll_limit = _clamp_limit(
+        scrolls, default=DEFAULT_SCROLLS, maximum=MAX_FEED_SCROLLS
     )
     capped_comment_limit = _clamp_limit(
         comment_limit, default=DEFAULT_COMMENT_LIMIT, maximum=MAX_COMMENT_LIMIT
@@ -603,11 +651,30 @@ async def collect_feed_engagement(
         reactor_limit, default=DEFAULT_REACTOR_LIMIT, maximum=MAX_REACTOR_LIMIT
     )
 
+    await _report_progress(
+        progress,
+        progress=1,
+        message=(
+            f"Preloading feed with {scroll_limit} scrolls"
+            if scroll_limit > 0
+            else "Preparing feed"
+        ),
+    )
+    await _preload_feed_posts(
+        extractor,
+        scrolls=scroll_limit,
+        progress=progress,
+    )
+    await _report_progress(
+        progress,
+        progress=45,
+        message="Extracting posts from loaded feed DOM",
+    )
     discovery = await search_feed_posts(
         extractor,
         keywords=keywords,
         max_posts=post_limit,
-        scrolls=scrolls,
+        scrolls=0,
         min_reactions=min_reactions,
         min_comments=min_comments,
         include_promoted=include_promoted,
@@ -615,7 +682,8 @@ async def collect_feed_engagement(
     result: dict[str, Any] = {
         "feed_url": FEED_URL,
         "limits": {
-            **discovery.get("limits", {}),
+            "posts": post_limit,
+            "scrolls": scroll_limit,
             "comments_per_post": capped_comment_limit,
             "reactors_per_post": capped_reactor_limit,
         },
@@ -649,6 +717,11 @@ async def collect_feed_engagement(
             index,
             len(discovered_posts),
             post_url,
+        )
+        await _report_progress(
+            progress,
+            progress=50 + int((index - 1) * 45 / max(1, len(discovered_posts))),
+            message=f"Enriching post {index}/{len(discovered_posts)}",
         )
 
         try:
@@ -707,4 +780,5 @@ async def collect_feed_engagement(
         len(result["posts"]),
         len(result["diagnostics"]),
     )
+    await _report_progress(progress, progress=100, message="Complete")
     return result
